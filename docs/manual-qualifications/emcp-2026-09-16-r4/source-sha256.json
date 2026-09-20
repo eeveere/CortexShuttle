@@ -1,0 +1,17 @@
+[
+  {
+    "Algorithm": "SHA256",
+    "Hash": "00E1962837D727FDBE0AEDFF9E1C3993954F5F25969ED2E389D631B6B658082F",
+    "Path": "C:\\dev\\CortexShuttle\\.shuttle\\manual-emcp-2026-09-15-r4\\cortexweave.sqlite"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "Path": "C:\\dev\\CortexShuttle\\.shuttle\\manual-emcp-2026-09-15-r4\\journal.owner.lock"
+  },
+  {
+    "Algorithm": "SHA256",
+    "Hash": "0CACBD08A69D6D80FBB85F283014857D396ED6B519EFB1DDAC8E67CD5C457FA8",
+    "Path": "C:\\dev\\CortexShuttle\\.shuttle\\manual-emcp-2026-09-15-r4\\journal.sqlite"
+  }
+]

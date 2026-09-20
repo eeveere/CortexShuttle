@@ -1,0 +1,28 @@
+/target/
+/.shuttle/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.local.toml
+*.log
+.env
+.env.*
+!.env.example
+
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Throwaway build dir used by adversarial-review sandboxes with limited disk
+# (CARGO_TARGET_DIR pointed inside the mount) — never meant to be committed
+.cts-review-target/
+
+docs/manual-qualifications

@@ -1,0 +1,41 @@
+[package]
+name = "cortex-shuttle"
+version = "0.1.0-dev"
+edition = "2024"
+description = "A local coding harness powered by CortexWeave"
+publish = false
+
+[[bin]]
+name = "shuttle"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+blake3 = "1"
+blake2 = "0.10"
+clap = { version = "4", features = ["derive"] }
+cortexweave = { git = "https://github.com/eeveere/CortexWeave.git", rev = "754126bfc2efd6330253826c89922148d33d9915", version = "=0.5.1" }
+crossterm = "0.28"
+fs2 = "0.4"
+ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal", "sync"] }
+uuid = { version = "1", features = ["v4"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_Debug", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.cortexweave]
+baseline-revision = "fe60a2334be774d0bdac67d4243d604788571eb4"
+integration = "CortexWeave v0.5.1 pinned to the published native terminal-receipt revision."

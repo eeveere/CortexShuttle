@@ -1,0 +1,28 @@
+{
+  "run_id": "a1ff07ff-de94-4168-b403-caf3732fd8ec",
+  "pending": [],
+  "scripted": false,
+  "verification_plan_revision": null,
+  "intake_preflight_snapshot": null,
+  "intake_preflight_stale_reason": null,
+  "intake_stale_preflights": 0,
+  "constraints": [],
+  "objective": "Correct AGENTS.md so its testing guidance accurately distinguishes the opt-in live embedding test from the MCP stdio end-to-end test.",
+  "phase": "paused",
+  "reason": "Model request failed; attempt and available usage retained",
+  "actions": [],
+  "model_responses": 2,
+  "pending_deliveries": 0,
+  "active_ms": 0,
+  "active_limit_ms": 3600000,
+  "process_active_ms": 0,
+  "stall_reason": null,
+  "acceptance": "No acceptance offer",
+  "acceptance_offer_id": null,
+  "general_workflow": true,
+  "direction": "Permission is saved. Request the bounded patch; it will revalidate before writing.",
+  "review": [
+    "Admission: e098c922-91f7-4356-b22b-ebc2951306b2",
+    "Evidence: not yet fresh"
+  ]
+}

@@ -1,0 +1,5 @@
+FROM rust:1.98-bookworm
+COPY --from=python:3.14.7-bookworm@sha256:ecac9e212daacda8a702eae372fceebc0ee36f5805abe087880367e8d061fa5b /usr/local /opt/python
+ENV PATH="/opt/python/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/opt/python/lib"
+RUN rustup component add rustfmt clippy
