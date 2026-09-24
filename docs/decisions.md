@@ -886,6 +886,32 @@ leaves the started request unknown; it never authorizes a second POST.
 | Action started, no committed success; crash before first write, between writes, or after sync | Unknown, even if files equal expected postimages. Inspect only; no automatic replay, rollback or manufactured success. |
 | Action success and postimage artifact committed | Return saved result; require explicit re-admission, complete verification, review, human accept/reject and ordered finalization. Never write again. |
 
+Clarification (2026-09-24, Chunk 3): three wire-level details were settled
+while implementing the adapter. They are refinements, not relaxations.
+
+1. **Offered tools.** `read_task_text` and `find_task_text` are offered only
+   while a read can still succeed: not on the fifth turn, and not once the read
+   count or the excerpt-byte budget is exhausted. Otherwise only
+   `record_task_patch` is offered. The saved request records the offered set,
+   and the decoder rejects any tool not in it, including a valid v2 tool on the
+   wrong turn.
+2. **Envelope tolerance.** The completion body is decoded once into typed
+   structures and never as a generic JSON value, so a repeated known field is an
+   error rather than last-wins, including inside `usage`. Every struct-shaped
+   level (envelope, choice, message, tool call, `function`, `usage`, argument
+   objects, files and hunks) must be a JSON object; a positional array is
+   rejected, so the wire has one representation. Unknown top-level, choice,
+   message and `usage` fields (for example llama.cpp `timings` or token-detail
+   breakdowns) are inert and ignored. The `function` object and every argument
+   object reject unknown fields. `content` must be a
+   string or null and is never interpreted. `object`, when present, must be
+   `chat.completion`.
+3. **Model-facing projection.** The frozen session definition stays in the
+   durable context. The provider sees only the objective, constraints, allowed
+   paths, and for each allowed file its hash, size and bounded preview, plus the
+   remaining budgets and replayed read pairs. Identity metadata (run, admission,
+   permission and profile IDs) is not sent to the model.
+
 ### Protocol examples
 
 In this table `\n`/`\r\n` denote decoded newlines, and every file supplies the

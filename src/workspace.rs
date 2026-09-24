@@ -2018,6 +2018,61 @@ fn patch_identity(
     Ok(hash.finalize().to_hex().to_string())
 }
 
+/// Preimage-independent S033 rules for a model-proposed v2 patch: counts,
+/// canonical paths, path budgets, hash spelling, nonempty/no-op hunks and the
+/// aggregate old+new text budget. The wire decoder applies it so hostile or
+/// oversized proposals fail before any journal work; the planner applies it
+/// again so neither caller can drift from the other. It proves nothing about
+/// anchors, permission or freshness; those need the admitted preimage.
+pub fn validate_text_patch_proposal(files: &[WorkspaceFilePatch]) -> Result<()> {
+    ensure!(
+        !files.is_empty() && files.len() <= MAX_WORKSPACE_TEXT_PATCH_FILES,
+        "text patch must contain one to eight files"
+    );
+    let mut seen = BTreeSet::new();
+    let (mut total_paths, mut total_hunks, mut total_text) = (0, 0, 0);
+    for file in files {
+        let path = canonical_text_patch_path(&file.path)?;
+        checked_add(
+            &mut total_paths,
+            path.len(),
+            MAX_WORKSPACE_TEXT_PATCH_PATH_TOTAL_BYTES,
+            "text patch paths exceed aggregate bound",
+        )?;
+        ensure!(seen.insert(path), "duplicate text patch path");
+        ensure!(
+            is_lower_blake3(&file.expected_file_hash),
+            "invalid text patch expected file hash"
+        );
+        ensure!(
+            !file.hunks.is_empty() && file.hunks.len() <= MAX_WORKSPACE_TEXT_PATCH_HUNKS_PER_FILE,
+            "text patch file has an invalid hunk count"
+        );
+        checked_add(
+            &mut total_hunks,
+            file.hunks.len(),
+            MAX_WORKSPACE_TEXT_PATCH_HUNKS,
+            "text patch has too many hunks",
+        )?;
+        for hunk in &file.hunks {
+            ensure!(
+                !hunk.old_utf8.is_empty(),
+                "text patch old text must be nonempty"
+            );
+            ensure!(hunk.old_utf8 != hunk.new_utf8, "text patch hunk is a no-op");
+            for text in [&hunk.old_utf8, &hunk.new_utf8] {
+                checked_add(
+                    &mut total_text,
+                    text.len(),
+                    MAX_WORKSPACE_TEXT_PATCH_TEXT_BYTES,
+                    "text patch old/new text exceeds aggregate bound",
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Resolve an admitted v2 hunk patch without filesystem, journal or model I/O.
 /// Every hunk is matched against the same immutable preimage; the returned
 /// postimages are constructed before a caller can begin any filesystem action.
@@ -2037,10 +2092,9 @@ pub fn plan_workspace_text_patch(
     ] {
         validate_patch_identity_component(value, name)?;
     }
-    ensure!(
-        !files.is_empty() && files.len() <= MAX_WORKSPACE_TEXT_PATCH_FILES,
-        "text patch must contain one to eight files"
-    );
+    // Shared with the wire decoder. The per-file checks below intentionally
+    // remain as a second, preimage-aware pass.
+    validate_text_patch_proposal(files)?;
 
     let mut permitted = BTreeSet::new();
     for path in &bindings.permitted_paths {

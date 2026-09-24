@@ -912,3 +912,103 @@ planned later milestones.
 General multi-check verification is now available for one admitted run. Model
 integration, user acceptance/finalization, worktrees, and commits remain outside
 this increment.
+
+## Admitted-edit v2 protocol: bounded text-patch sessions (2026-09-15 to 2026-09-20)
+
+The retained task at `.shuttle/manual-emcp-2026-09-15-r4` exercised intake,
+preflight, admission, read-only planning, path permission and the beginning of
+editing; its permitted patch request reached the pinned worker and returned
+HTTP 200, but the raw streamed response crossed Shuttle's 65,536-byte transport
+bound before a complete response and usage record arrived, and Shuttle paused
+the task without applying a workspace action. This is a protocol problem, not
+an emCP problem: the v1 admitted-edit protocol requires the model to return
+every byte of every replacement file as JSON integers, so a small change to an
+approximately 11.6 KiB file such as `AGENTS.md` exceeds the configured output
+budget and transport envelope. `.shuttle/DO-WE-REALLY-HAVE-TO-REPLACE-THE-WHOLE-FILE.md`
+records the resulting v2 bounded transactional text-patch protocol and an
+eight-chunk delivery plan (Chunk 0 through Chunk 7) that replaces it while
+keeping the existing admission, permission, durability, freshness, review and
+verification boundaries.
+
+Chunk 2a's build gate (2026-09-18) recorded a toolchain deviation to native
+Rust 1.98 (matching `tests/Dockerfile.qualification`'s pin) and one mechanical
+Clippy fix. Chunk 2b (2026-09-18) added the durable session ledger: migration
+0022 creates the `admitted_edit_sessions`, `admitted_edit_turns` and
+`admitted_edit_observations` tables with immutability, retention and
+monotonic-counter triggers, backing a new journal-owned session lifecycle in
+`src/edit_session.rs` (`AdmittedEditSession`, `fresh_edit_session`,
+`open_admitted_edit_session`, `prepare_admitted_edit_turn`,
+`finish_admitted_text_read`, `close_edit_session`, `read_admitted_file`).
+
+An independent adversarial review of Chunk 2b (2026-09-20) found the
+canonicalized-root freshness binding was already correct (a misdiagnosis, not
+a gap), confirmed that read/turn-budget closure is intended behavior and
+recorded that in S033's clarifications (`docs/decisions.md`, 2026-09-18 and
+2026-09-20), and required three fixes, all applied the same day: [F1] splits
+the combined read-turn-budget check into an independently testable
+`ensure_read_turn_available` function so each clause is pinned by its own
+test; [F2] adds a regression test proving drift introduced after a session
+starts is still caught at the read boundary; [F3] separates "settled and
+applied" from merely "settled" in `finish_admitted_text_read`'s early-bail
+path, so a successful replay is rejected without closing the session while an
+unknown settled request still leaves it closed. `tests/edit_session.rs` grew
+from 13 to 15 cases; `cargo fmt --check`, `cargo check --locked`,
+`cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`
+all pass. This closes Chunk 2b; Chunk 3 (the local-model v2 wire protocol) is
+next.
+
+Correction (2026-09-24): the "`cargo test --locked` all pass" above is not
+supported by retained evidence. No log of the 2026-09-20 run exists. The
+recorded 2b gate ran focused test binaries only. Every environment used for
+Chunks 2a–3 had Python 3.11 instead of the pinned 3.14.7, in which five
+pinned-Python tests (`evidence_qualification::real_unittest_callbacks_…`, three
+`live_repair` tests and `live_repair_cli`) fail with
+`test_profile_component_mismatch`. The first full locked suite on a tree
+containing Chunk 2b ran on 2026-09-24, together with Chunk 3. It passed on
+Windows MSVC (201 passed, 10 ignored helpers) and in the pinned
+`tests/Dockerfile.qualification` Rust 1.98/Python 3.14.7 image (204 passed, 10
+ignored helpers), with formatting and warnings-denied Clippy passing on both.
+Logs are retained in ignored `.shuttle/reconcile-windows-gate.log` and
+`.shuttle/reconcile-docker-linux.log`.
+
+Chunk 3 (2026-09-24) added the S033 local-model v2 wire adapter. It covers the
+`shuttle-llama-admitted-editing-v2:<profile_digest>` provider bound to one edit
+session, a shared typed turn context (`AdmittedEditTurnContext`) and a strict
+parser for it, and three strict tool schemas. Requests are non-streamed
+`application/json`, with the POST and conservative `n_ctx` checks. Response
+headers are checked (content type, charset and encoding), and a new decoder
+(`src/llama/completion.rs`) parses the body once. That decoder rejects
+duplicate keys at every level and enforces every S033 wire and decoded bound
+through a validator it shares with the pure planner. It also offers tools per
+turn (patch-only when reads cannot succeed) and cannot receive a v1 request.
+`tests/llama_edit_v2.rs` drives it through the real journal session against a
+mock worker. A synthetic emCP-shaped paragraph edit measured 556 argument bytes
+and a 1,066-byte response. The tool-call tokens are strictly bounded only
+against the 2,048 output maximum; fit under the default 512 is an estimate until
+the live run. fmt, check, Clippy (warnings denied) and the focused tests pass on
+native Rust 1.98.0, run in Claude's cloud workspace rather than on the operator
+machine (recorded in the plan). Orchestration, durable patch preparation and
+application are Chunk 4. The Chunk 3 review (Sonnet, high) is pending.
+
+## Milestone 3 scope check (2026-09-21)
+
+The master plan (`docs/.shuttle-priv/dedicated-harness-plan.md`, moved here
+from CortexWeave on 2026-09-21 and gitignored) files the admitted-edit v2
+protocol under Milestone 3, "Context and repository history," whose full
+deliverable list is bounded request composition, conservative refresh policy,
+native repository membership, eligible sibling retrieval, and separate
+history/hydration inventories, with exit evidence including sibling positive
+and isolation/lifecycle/removal negative cases.
+
+The Chunk 0-7 plan only covers the first two of those five deliverables. Its
+own scope section is explicit: existing declared regular UTF-8 files in the
+single currently-admitted workspace. It does not mention repository
+membership, sibling retrieval, or hydration inventories anywhere, and no
+chunk in it targets the master plan's §6.1 mixed-packet hydration contract,
+`HarnessHydrationRequest::from_context` origin separation, or sibling-worktree
+test scenarios. Completing Chunk 7 will not by itself satisfy Milestone 3's
+exit evidence. This entry exists because the gap was previously silent: the
+"Repository-scoped historical Experience... stay in their planned later
+milestones" note above (2026-09-13, predating this entire increment) reads as
+still current but does not say whether that work is expected inside Milestone
+3 or after it. That ambiguity is unresolved as of this entry.

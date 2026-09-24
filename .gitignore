@@ -26,3 +26,7 @@ desktop.ini
 .cts-review-target/
 
 docs/manual-qualifications
+
+# Master planning docs relocated here from CortexWeave (docs/.shuttle-priv/).
+# Kept private/local-only on purpose — see docs/.shuttle-priv/README.md.
+/docs/.shuttle-priv

@@ -123,6 +123,139 @@ pub struct AdmittedReadHistoryPair {
     pub observation: AdmittedTextObservation,
 }
 
+/// The first observation of every v2 edit turn: the frozen session definition
+/// plus the budgets that remain *before* this turn. The journal produces it and
+/// the wire adapter consumes it, so both sides share one type rather than
+/// agreeing on ad hoc JSON keys.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmittedEditTurnContext {
+    pub session: AdmittedEditSessionDefinition,
+    pub session_id: String,
+    pub turn_index: u32,
+    pub remaining_turns: u32,
+    pub remaining_reads: u32,
+    pub remaining_excerpt_bytes: usize,
+    pub patch_only: bool,
+}
+
+impl AdmittedEditTurnContext {
+    pub fn observation_key(session_id: &str) -> String {
+        format!("{session_id}/initial")
+    }
+
+    /// Canonical encoding: routed through `Value`, whose map is ordered in this
+    /// build (see `json_object_keys_are_lexically_ordered`), so keys are sorted
+    /// recursively. This is byte-identical to the `json!` form used before the
+    /// type existed.
+    pub fn encode(&self) -> Result<String> {
+        Ok(serde_json::to_string(&serde_json::to_value(self)?)?)
+    }
+
+    /// Internal consistency only. It proves the context is a well-formed v2 turn
+    /// for its own definition; it does not prove the session is still fresh.
+    pub fn validate(&self) -> Result<()> {
+        let session = &self.session;
+        ensure!(
+            session.version == 2
+                && session.bounds_revision == 1
+                && session.protocol == EDIT_PROTOCOL
+                && valid_profile_digest(&session.profile_digest),
+            "edit turn context is not admitted editing v2"
+        );
+        ensure!(
+            session_id(session)? == self.session_id,
+            "edit turn context session identity mismatch"
+        );
+        ensure!(
+            identity(
+                "shuttle-edit-initial-context-v2\0",
+                &session.initial_context
+            )? == session.initial_context_hash,
+            "edit turn context initial context changed"
+        );
+        ensure!(
+            self.turn_index < MAX_EDIT_TURNS
+                && self.remaining_turns == MAX_EDIT_TURNS - self.turn_index
+                && self.remaining_reads <= MAX_EDIT_READS
+                && self.remaining_excerpt_bytes <= MAX_EDIT_READ_BYTES
+                && self.patch_only == (self.turn_index == MAX_EDIT_TURNS - 1),
+            "edit turn context budgets are inconsistent"
+        );
+        Ok(())
+    }
+
+    /// Whether a read or find can possibly succeed on this turn. The adapter
+    /// offers read tools only when this holds, so a model cannot spend its
+    /// turn on a call the journal is certain to reject.
+    pub fn reads_available(&self) -> bool {
+        !self.patch_only && self.remaining_reads > 0 && self.remaining_excerpt_bytes > 0
+    }
+}
+
+/// Recover the typed turn and its ordered read history from a durable
+/// `ModelContext`. Every string must be the exact canonical encoding of the
+/// parsed value, and history must agree with the budgets, so a context that did
+/// not come from `edit_model_context` cannot be presented as one.
+pub fn parse_edit_model_context(
+    context: &ModelContext,
+) -> Result<(AdmittedEditTurnContext, Vec<AdmittedReadHistoryPair>)> {
+    ensure!(
+        context.actions.is_empty() && context.replan_direction.is_none(),
+        "edit context must not carry fixture actions or replanning"
+    );
+    let ((key, initial), history) = context
+        .observations
+        .split_first()
+        .context("edit context is missing its initial turn observation")?;
+    let turn: AdmittedEditTurnContext = serde_json::from_str(initial)?;
+    ensure!(
+        *key == AdmittedEditTurnContext::observation_key(&turn.session_id)
+            && turn.encode()? == *initial,
+        "edit context initial observation is not canonical"
+    );
+    turn.validate()?;
+    ensure!(
+        context.input_hash == turn.session.permission.snapshot_id,
+        "edit context snapshot differs from its permission"
+    );
+    ensure!(
+        history.len() == (MAX_EDIT_READS - turn.remaining_reads) as usize,
+        "edit context history disagrees with the read budget"
+    );
+    let mut pairs = Vec::with_capacity(history.len());
+    let mut spent = 0usize;
+    let mut previous: Option<u32> = None;
+    for (key, encoded) in history {
+        let pair: AdmittedReadHistoryPair = serde_json::from_str(encoded)?;
+        let observation = &pair.observation;
+        ensure!(
+            serde_json::to_string(&pair)? == *encoded
+                && *key == pair.tool_call_id
+                && pair.tool_call_id == observation.tool_call_id
+                && pair.operation == observation.operation
+                && observation.version == 2
+                && observation.bounds_revision == 1
+                && observation.session_id == turn.session_id
+                && observation.tool_call_id
+                    == format!("{}_read_{}", turn.session_id, observation.turn_index)
+                && observation.turn_index < turn.turn_index
+                && previous.is_none_or(|p| p < observation.turn_index),
+            "edit context read history is inconsistent"
+        );
+        previous = Some(observation.turn_index);
+        spent = spent
+            .checked_add(observation.result.text_bytes())
+            .context("edit context read bytes overflow")?;
+        pairs.push(pair);
+    }
+    ensure!(
+        spent == MAX_EDIT_READ_BYTES - turn.remaining_excerpt_bytes,
+        "edit context history disagrees with the excerpt budget"
+    );
+    Ok((turn, pairs))
+}
+
 pub(crate) fn valid_profile_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -390,14 +523,19 @@ impl Journal {
         session: &AdmittedEditSession,
         turn: u32,
     ) -> Result<ModelContext> {
-        let initial = serde_json::json!({"session":session.definition,"session_id":session.id,
-            "turn_index":turn,"remaining_turns":MAX_EDIT_TURNS.saturating_sub(turn),
-            "remaining_reads":MAX_EDIT_READS.saturating_sub(session.read_count),
-            "remaining_excerpt_bytes":MAX_EDIT_READ_BYTES.saturating_sub(session.read_bytes),
-            "patch_only":turn == MAX_EDIT_TURNS - 1});
+        let initial = AdmittedEditTurnContext {
+            session: session.definition.clone(),
+            session_id: session.id.clone(),
+            turn_index: turn,
+            remaining_turns: MAX_EDIT_TURNS.saturating_sub(turn),
+            remaining_reads: MAX_EDIT_READS.saturating_sub(session.read_count),
+            remaining_excerpt_bytes: MAX_EDIT_READ_BYTES.saturating_sub(session.read_bytes),
+            patch_only: turn == MAX_EDIT_TURNS - 1,
+        };
+        initial.validate()?;
         let mut observations = vec![(
-            format!("{}/initial", session.id),
-            serde_json::to_string(&initial)?,
+            AdmittedEditTurnContext::observation_key(&session.id),
+            initial.encode()?,
         )];
         for pair in self.admitted_read_history(&session.id).await? {
             observations.push((pair.tool_call_id.clone(), serde_json::to_string(&pair)?));
@@ -748,4 +886,21 @@ fn read_admitted_file(root: &Path, relative: &str, expected_hash: &str) -> Resul
         "read target identity changed"
     );
     Ok(bytes)
+}
+
+#[cfg(test)]
+mod encoding_tests {
+    /// Every identity and canonical encoding built through `serde_json::Value`
+    /// assumes its map is ordered by key. That holds only while no *normal*
+    /// dependency enables serde_json's `preserve_order` (tree-sitter enables it
+    /// for a build dependency, which resolver 2+ keeps separate). If feature
+    /// unification ever changes that, this fails before any identity silently
+    /// changes.
+    #[test]
+    fn json_object_keys_are_lexically_ordered() {
+        assert_eq!(
+            serde_json::json!({"b": 1, "a": {"d": 1, "c": 2}}).to_string(),
+            r#"{"a":{"c":2,"d":1},"b":1}"#
+        );
+    }
 }

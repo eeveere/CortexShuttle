@@ -152,8 +152,10 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-Source plan: revision 4 of `docs/dedicated-harness-plan.md` in CortexWeave history
-at `fe60a2334be774d0bdac67d4243d604788571eb4` (removed from its current checkout).
+Source plan: `docs/.shuttle-priv/dedicated-harness-plan.md` in this repo (private,
+gitignored — see that folder's README). It originated as revision 4 of the
+same-named file in CortexWeave history at `fe60a2334be774d0bdac67d4243d604788571eb4`
+and moved here on 2026-09-21 since Shuttle is the project it describes.
 The native receipt patch is published at
 `754126bfc2efd6330253826c89922148d33d9915`. The original baseline remains in Cargo
 metadata for historical reference. See [terminal qualification](docs/terminal-qualification.md)
