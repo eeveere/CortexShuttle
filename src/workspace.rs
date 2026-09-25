@@ -189,6 +189,11 @@ pub struct TaskAcceptanceOfferView {
     pub evidence: SuiteEvidenceView,
     pub stale_reason: Option<String>,
     pub decision: Option<TaskAcceptanceDecision>,
+    /// Bounded review of the offered edit: exact hunks for a v2 patch, file
+    /// summaries for a historical whole-file action. Derived when read, never
+    /// part of the offer's identity.
+    #[serde(default)]
+    pub change: Option<crate::edit_review::EditReview>,
 }
 
 /// Immutable explicit user response for one admitted-task review offer.
@@ -458,11 +463,17 @@ impl TaskReader {
                 ToolCall::ReplaceFixture { .. } => "replace fixture".into(),
                 ToolCall::RunProcess(spec) => format!("run {}", spec.executable.display()),
                 ToolCall::WriteWorkspaceFiles { edits } => {
-                    format!("write {} permitted file(s)", edits.len())
+                    format!("whole-file write, {} file(s) (historical)", edits.len())
                 }
-                ToolCall::PatchWorkspaceFiles { patch } => {
-                    format!("patch {} permitted file(s)", patch.files.len())
-                }
+                ToolCall::PatchWorkspaceFiles { patch } => format!(
+                    "text patch, {} file(s), {} hunk(s)",
+                    patch.files.len(),
+                    patch
+                        .files
+                        .iter()
+                        .map(|file| file.hunks.len())
+                        .sum::<usize>()
+                ),
             };
             actions.push(format!("{state}  {call}"));
             if matches!(state.as_str(), "prepared" | "started" | "unknown") {
@@ -471,6 +482,12 @@ impl TaskReader {
                     state.to_uppercase(),
                     intent.id
                 ));
+                if matches!(state.as_str(), "started" | "unknown") {
+                    pending.push(
+                        "  Outcome unknown: inspect the workspace. Nothing replays automatically."
+                            .into(),
+                    );
+                }
             }
         }
         for row in sqlx::query("SELECT id, state FROM model_requests WHERE applied = 0 OR state IN ('started', 'unknown') ORDER BY ordinal")
@@ -590,6 +607,10 @@ impl TaskReader {
             if let Some(choice) = &decision {
                 review.push(format!("Recorded decision: {choice}"));
             }
+            if let Some(edit) = crate::edit_review::load_task_edit_review(&mut tx).await? {
+                review.push(String::new());
+                review.extend(edit.lines());
+            }
             let direction = if phase == "finalizing" {
                 "Acceptance is saved; resume ordered native finalization.".into()
             } else if phase == "finalized" {
@@ -700,11 +721,19 @@ async fn task_acceptance_offer_view_locked(
             .execute(&journal.pool)
             .await?;
     }
+    let change = match journal.action(&offer.change_action_id).await? {
+        Some(record) => {
+            let mut conn = journal.pool.acquire().await?;
+            crate::edit_review::load_change_review(&mut conn, &record).await?
+        }
+        None => None,
+    };
     Ok(Some(TaskAcceptanceOfferView {
         offer,
         evidence,
         stale_reason,
         decision,
+        change,
     }))
 }
 
@@ -1694,6 +1723,15 @@ pub(crate) async fn current_write_permission_view(
 }
 
 impl TaskReader {
+    /// Bounded review of the admitted edit session and its latest change, read
+    /// from saved state only. `None` when the task never had an edit.
+    pub async fn edit_review(&self) -> Result<Option<crate::edit_review::TaskEditReview>> {
+        let mut tx = self.pool.begin().await?;
+        let review = crate::edit_review::load_task_edit_review(&mut tx).await?;
+        tx.commit().await?;
+        Ok(review)
+    }
+
     /// Read the current proposal and any durable permission without migrating,
     /// recovering a journal, calling a model, or changing workspace state.
     pub async fn write_permission_view(&self) -> Result<TaskWritePermissionView> {

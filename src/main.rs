@@ -4,6 +4,7 @@ use cortex_shuttle::{
     acceptance::{UserChoice, UserResponse},
     adapter::CortexWeaveAdapter,
     controller::{Controller, Fault, ToolExecutor, flush_outbox},
+    edit_review,
     fixture::Fixture,
     journal::{ActionIntent, Grant, Journal, ToolCall},
     llama::{LlamaModel, LlamaProfile},
@@ -258,6 +259,15 @@ enum Command {
     TaskWriteStatus {
         #[arg(long)]
         state_dir: PathBuf,
+    },
+    /// Show what the admitted edit changed (or why it was blocked): the exact
+    /// compact hunks, hashes and session ledger, from saved state only.
+    TaskEditReview {
+        #[arg(long)]
+        state_dir: PathBuf,
+        /// Print the complete structured review instead of the bounded text.
+        #[arg(long)]
+        json: bool,
     },
     /// Persist one explicit human grant for the exact current planning context; no file is edited.
     TaskWriteGrant {
@@ -960,6 +970,17 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                         result?;
                     }
                     ui::TaskWorkspaceEvent::ReviewAcceptance(offer_id) => {
+                        // A general-task offer is not in the generic offer table.
+                        // Show it, with the exact edit, from the task review.
+                        let task_offer = workspace::task_acceptance_offer_view(&state_dir)
+                            .await
+                            .ok()
+                            .flatten()
+                            .filter(|view| view.offer.id == offer_id);
+                        if let Some(view) = task_offer {
+                            print_task_offer_review(&view)?;
+                            break;
+                        }
                         let mut journal = open_existing_journal(&state_dir).await?;
                         let result = print_acceptance_review(&mut journal, &offer_id).await;
                         journal.close().await;
@@ -1086,6 +1107,20 @@ async fn run_command(command: Box<Command>) -> Result<()> {
             let view = reader.write_permission_view().await?;
             reader.close().await;
             println!("{}", serde_json::to_string_pretty(&view)?);
+        }
+        Command::TaskEditReview { state_dir, json } => {
+            let reader = TaskReader::open(&state_dir).await?;
+            let review = reader.edit_review().await?;
+            reader.close().await;
+            match (review, json) {
+                (Some(review), true) => println!(
+                    "{}",
+                    edit_review::json_terminal_safe(&serde_json::to_string_pretty(&review)?)
+                ),
+                (Some(review), false) => review.lines().iter().for_each(|line| println!("{line}")),
+                (None, true) => println!("null"),
+                (None, false) => println!("No admitted edit has been attempted for this task."),
+            }
         }
         Command::TaskWriteGrant {
             state_dir,
@@ -1336,7 +1371,7 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                 view.offer.id == offer_id,
                 "task acceptance response names another offer"
             );
-            println!("{}", serde_json::to_string_pretty(&view)?);
+            print_task_offer_review(&view)?;
             let verb = match choice {
                 UserChoice::Accept => "accept",
                 UserChoice::Reject => "reject",
@@ -1670,11 +1705,26 @@ async fn open_existing_journal(state_dir: &std::path::Path) -> Result<Journal> {
     Journal::open(&path).await
 }
 
-async fn print_acceptance_review(journal: &mut Journal, offer_id: &str) -> Result<()> {
-    // JSON escapes source-controlled text and terminal control characters.
+/// The exact edit first, as bounded text, then the complete offer as JSON.
+fn print_task_offer_review(view: &workspace::TaskAcceptanceOfferView) -> Result<()> {
+    if let Some(change) = &view.change {
+        change.lines().iter().for_each(|line| println!("{line}"));
+        println!();
+    }
     println!(
         "{}",
-        serde_json::to_string_pretty(&journal.acceptance_review(offer_id).await?)?
+        edit_review::json_terminal_safe(&serde_json::to_string_pretty(view)?)
+    );
+    Ok(())
+}
+
+async fn print_acceptance_review(journal: &mut Journal, offer_id: &str) -> Result<()> {
+    // JSON escapes C0 controls; `json_terminal_safe` covers the rest.
+    println!(
+        "{}",
+        edit_review::json_terminal_safe(&serde_json::to_string_pretty(
+            &journal.acceptance_review(offer_id).await?
+        )?)
     );
     Ok(())
 }

@@ -1173,6 +1173,34 @@ async fn the_edit_workflow_finds_patches_and_applies_through_the_real_adapter() 
         "find_task_text"
     );
 
+    // The operator's review shows the read, the patch turn and the exact
+    // paragraph change from saved state alone.
+    let reader = workspace::TaskReader::open(&h.state).await.unwrap();
+    let review = reader.edit_review().await.unwrap().unwrap().lines().join(
+        "
+",
+    );
+    reader.close().await;
+    for expected in [
+        "closed: patch prepared",
+        "reads 1 of 4",
+        "turn 0: read committed",
+        "turn 1: patch prepared",
+        "[SUCCEEDED]",
+        "  AGENTS.md",
+        "read back after write: matches",
+    ] {
+        assert!(
+            review.contains(expected),
+            "missing {expected:?} in
+{review}"
+        );
+    }
+    let first_old = OLD_TESTING.lines().next().unwrap();
+    let first_new = NEW_TESTING.lines().next().unwrap();
+    assert!(review.contains(&format!("    - {first_old}")), "{review}");
+    assert!(review.contains(&format!("    + {first_new}")), "{review}");
+
     // Rerunning returns the saved success with no POST and no write.
     fs::write(
         h.workspace.join("src/lib.rs"),
@@ -1217,6 +1245,17 @@ async fn a_reply_outside_the_protocol_fails_the_turn_without_a_retry() {
     assert!(journal.actions().await.unwrap().is_empty());
     assert_eq!(journal.run().await.unwrap().unwrap().phase, "paused");
     journal.close().await;
+
+    let reader = workspace::TaskReader::open(&h.state).await.unwrap();
+    let review = reader.edit_review().await.unwrap().unwrap();
+    reader.close().await;
+    assert!(review.change.is_none(), "no edit was prepared");
+    let text = review.lines().join(
+        "
+",
+    );
+    assert!(text.contains("turn 0: rejected: "), "{text}");
+    assert!(text.contains("  closed: "), "{text}");
 
     let error = run_edit(&h).await.unwrap_err().to_string();
     assert!(error.contains("fresh task state"), "{error}");

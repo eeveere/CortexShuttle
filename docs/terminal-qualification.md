@@ -92,8 +92,11 @@ evidence checks, immutable decision recording and ordered native delivery. A
 screen redraw, key repeat, or stale cached projection cannot grant authority or
 manufacture a pass, acceptance, or finalization. Rejection records no native
 finalization. Full review details remain available through `task-offer-review`;
-the workspace deliberately renders bounded summaries rather than patch bytes or
-unbounded artifacts.
+the workspace renders the admitted edit as bounded, escaped review lines (file
+and hunk counts, hashes, and the exact compact hunks, at most 1,024 bytes per
+side and 160 lines, with an explicit "not shown" marker for anything cut)
+rather than whole files or unbounded artifacts. `task-edit-review` prints the
+same review, and `--json` adds every hunk in full.
 
 Focused terminal layout, interaction, task-workspace and planning coverage passed
 on Windows. The final read-only Docker Linux qualification completed with the full

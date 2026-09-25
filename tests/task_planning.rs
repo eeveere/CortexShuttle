@@ -803,6 +803,20 @@ async fn review_offer_binds_the_exact_edit_to_fresh_suite_evidence_and_stales() 
         successor.preflight_snapshot
     );
     assert!(offer.stale_reason.is_none());
+    // The offer carries the exact edit under review, not just its identity.
+    let change = offer.change.as_ref().expect("offer view shows its edit");
+    assert_eq!(change.action_id, edit.intent.id);
+    assert_eq!(change.hunk_count, 1);
+    assert_eq!(change.files[0].path, "src/main.rs");
+    assert_eq!(change.files[0].observed_matches(), Some(true));
+    let lines = change.lines().join(
+        "
+",
+    );
+    assert!(
+        lines.contains("[SUCCEEDED]") && lines.contains("    + "),
+        "{lines}"
+    );
     let replay = workspace::offer_task_acceptance(&state, "offer-1")
         .await
         .unwrap();

@@ -1000,3 +1000,201 @@ async fn only_the_patched_files_archive_bit_is_excluded_from_the_comparison() {
         journal.close().await;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Chunk 5: operator review projections, read through the same reader the task
+// view uses (read-only, no recovery, no model, no workspace access).
+// ---------------------------------------------------------------------------
+
+async fn review_lines(harness: &Harness) -> (Vec<String>, cortex_shuttle::ui::TaskView) {
+    let reader = workspace::TaskReader::open(&harness.state).await.unwrap();
+    let view = reader.view().await.unwrap();
+    let review = reader.edit_review().await.unwrap();
+    reader.close().await;
+    let lines = review.map(|r| r.lines()).unwrap_or_default();
+    // The task view carries the same review, so the terminal shows it too.
+    for line in &lines {
+        assert!(
+            view.review.contains(line),
+            "task view is missing review line {line:?}"
+        );
+    }
+    (lines, view)
+}
+
+#[tokio::test]
+async fn a_task_that_never_edited_has_no_edit_review() {
+    let harness = Harness::new().await;
+    let reader = workspace::TaskReader::open(&harness.state).await.unwrap();
+    assert!(reader.edit_review().await.unwrap().is_none());
+    let view = reader.view().await.unwrap();
+    reader.close().await;
+    assert!(!view.review.iter().any(|line| line.starts_with("EDIT")));
+}
+
+#[tokio::test]
+async fn a_completed_edit_shows_its_exact_hunks_without_reading_the_workspace() {
+    let harness = Harness::new().await;
+    let (journal, action_id) = prepared(&harness).await;
+
+    // Before application: prepared, nothing written, exact hunks already shown.
+    journal.close().await;
+    let (lines, view) = review_lines(&harness).await;
+    let text = lines.join("\n");
+    assert!(text.contains("[PREPARED]"), "{text}");
+    assert!(text.contains("BLOCKED: Prepared but not applied"), "{text}");
+    assert!(text.contains("closed: patch prepared"), "{text}");
+    assert!(
+        view.actions
+            .iter()
+            .any(|a| a == "prepared  text patch, 2 file(s), 2 hunk(s)"),
+        "{:?}",
+        view.actions
+    );
+
+    let mut journal = harness.journal().await;
+    journal.apply_admitted_text_patch(&action_id).await.unwrap();
+    journal.close().await;
+    // Anything the operator changes afterwards must not alter a saved review.
+    harness.write("src/a.txt", b"changed after the fact\n");
+
+    let (lines, view) = review_lines(&harness).await;
+    let text = lines.join("\n");
+    for expected in [
+        "EDIT SESSION",
+        "closed: patch prepared",
+        "turns 1 of 5  /  reads 0 of 4  /  read bytes 0 of 6144",
+        "turn 0: patch prepared",
+        "EDIT  text patch  2 file(s), 2 hunk(s)  [SUCCEEDED]",
+        "  src/a.txt",
+        "    11 -> 12 bytes",
+        "    @@ bytes 6..10 (4 -> 5) @@",
+        "    - beta",
+        "    + gamma",
+        "  src/b.txt",
+        "    @@ bytes 5..10 (5 -> 12) @@",
+        "    - two\\r",
+        "    + TWO\\r",
+        "    + three\\r",
+        "Limitation: Each target is written in place",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+    }
+    assert_eq!(
+        text.matches("read back after write: matches").count(),
+        2,
+        "{text}"
+    );
+    assert!(!text.contains("BLOCKED"), "{text}");
+    assert!(
+        view.actions
+            .iter()
+            .any(|a| a == "succeeded  text patch, 2 file(s), 2 hunk(s)"),
+        "{:?}",
+        view.actions
+    );
+
+    // The structured form keeps the full hunk text for a machine reader.
+    let reader = workspace::TaskReader::open(&harness.state).await.unwrap();
+    let review = reader.edit_review().await.unwrap().unwrap();
+    reader.close().await;
+    let change = review.change.unwrap();
+    assert_eq!(change.hunk_count, 2);
+    assert!(
+        change
+            .files
+            .iter()
+            .all(|f| f.observed_matches() == Some(true))
+    );
+    assert_eq!(change.files[0].hunks[0].old_utf8, "beta");
+}
+
+#[tokio::test]
+async fn a_rejected_patch_says_why_and_shows_no_change() {
+    let harness = Harness::new().await;
+    let mut journal = harness.journal().await;
+    let session = session(&mut journal).await;
+    let stale = vec![file(
+        "src/a.txt",
+        b"not the admitted preimage",
+        &[("beta", "gamma")],
+    )];
+    patch_turn(&mut journal, &session, stale).await.unwrap_err();
+    journal.close().await;
+
+    let (lines, view) = review_lines(&harness).await;
+    let text = lines.join("\n");
+    assert!(text.contains("EDIT SESSION"), "{text}");
+    assert!(text.contains("  closed: "), "{text}");
+    assert!(text.contains("turn 0: rejected: "), "{text}");
+    assert!(!text.contains("EDIT  "), "no change exists:\n{text}");
+    assert_eq!(view.phase, "paused");
+    assert_eq!(harness.read("src/a.txt"), A_PRE);
+}
+
+#[tokio::test]
+async fn a_cancelled_patch_reports_that_nothing_was_written() {
+    let harness = Harness::new().await;
+    let (mut journal, action_id) = prepared(&harness).await;
+    harness.write("src/other.rs", b"// changed after preparation\n");
+    journal
+        .apply_admitted_text_patch(&action_id)
+        .await
+        .unwrap_err();
+    journal.close().await;
+
+    let (lines, view) = review_lines(&harness).await;
+    let text = lines.join("\n");
+    assert!(text.contains("[CANCELLED]"), "{text}");
+    assert!(
+        text.contains("BLOCKED: Cancelled before any write: Patch cancelled before start: "),
+        "{text}"
+    );
+    assert!(text.contains("Declared inputs differ"), "{text}");
+    // The hunks the operator would have accepted remain visible.
+    assert!(text.contains("    + gamma"), "{text}");
+    assert!(!text.contains("read back after write"), "{text}");
+    assert_eq!(view.phase, "paused");
+    assert!(
+        view.reason.contains("Declared inputs differ"),
+        "{}",
+        view.reason
+    );
+    assert_eq!(harness.read("src/a.txt"), A_PRE);
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_is_flagged_as_pending_and_blocked() {
+    let harness = Harness::new().await;
+    let (mut journal, action_id) = prepared(&harness).await;
+    journal
+        .apply_admitted_text_patch_with_faults(&action_id, &mut |stage| {
+            (stage == PatchStage::Written(1)).then_some(PatchFault::Crash)
+        })
+        .await
+        .unwrap_err();
+    journal.close().await;
+    // Reopening the journal records the started action as unknown.
+    harness.journal().await.close().await;
+
+    let (lines, view) = review_lines(&harness).await;
+    let text = lines.join("\n");
+    assert!(text.contains("[UNKNOWN]"), "{text}");
+    assert!(text.contains("BLOCKED: Outcome unknown"), "{text}");
+    assert!(text.contains("nothing replays automatically"), "{text}");
+    assert!(
+        view.pending
+            .iter()
+            .any(|p| p.starts_with("UNKNOWN action ")),
+        "{:?}",
+        view.pending
+    );
+    assert!(
+        view.pending
+            .iter()
+            .any(|p| p.contains("inspect the workspace")),
+        "{:?}",
+        view.pending
+    );
+    assert!(!text.contains("read back after write"), "{text}");
+}

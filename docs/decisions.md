@@ -1036,6 +1036,49 @@ there).
    review can still finish. The v1 adapter constructor is kept only so tests
    can prove that a v1 request never reaches the v2 decoder.
 
+Clarification (2026-09-24, Chunk 5: operator review projections). This adds no
+authority and changes no stored bytes; it only says what the reader may show.
+
+1. **Read-only and saved-state-only.** The review is derived from the session
+   ledger, the prepared action intent and its hash-verified completion
+   artifact. It never reads the workspace, calls a model or authorizes an
+   action, so a later change to a file cannot alter what a saved review says.
+   The task view and `task-edit-review` read through `TaskReader`, a read-only
+   connection that neither migrates nor recovers the journal, and tolerate
+   journals from before migrations 0022 and 0023. The task acceptance offer
+   view (and so the offer's `change` field, Ctrl+R and the offer response
+   prompt) opens the journal with `Journal::open`, as that view always has, so
+   it may migrate and recover the journal and refresh the offer's stale
+   reason. The review content it adds is still derived from saved state only.
+2. **Absent is not matched.** A file's read-back hash is reported only when the
+   completion artifact records one. A missing or hash-mismatched artifact, or a
+   succeeded patch whose artifact records no hash for a file, is stated as such
+   and is never shown as a match.
+3. **Blocked states are named.** Prepared means nothing was written. Cancelled
+   repeats the saved reason and says nothing was written. Started and unknown
+   say the workspace may hold any mix of old and new text and that nothing
+   replays. A rejected turn shows its saved diagnostic.
+4. **Bounded and escaped.** Rendered hunks show at most 1,024 bytes per side and
+   160 lines, cut on a character boundary, each cut marked with the number of
+   bytes or lines left out. The structured (JSON) review keeps every hunk, which
+   the wire bounds already limit. Backslash, tab and carriage return are spelled
+   out. Every other control (C0, DEL and C1, newline included) and every
+   character in a fixed list is shown as `\u{..}`. The list is the
+   bidirectional and zero-width marks and overrides, line and paragraph
+   separators, soft hyphen, combining grapheme joiner, variation selectors,
+   the deprecated format characters U+206A–U+206F, interlinear annotation,
+   Hangul, Khmer and Mongolian fillers and separators, and the tag block
+   U+E0000–U+E0FFF. It is a hand-written list, not the full Unicode `Cf`
+   category, so a format character outside it is displayed as itself. A
+   reason or diagnostic is cut at 240 displayed characters between escapes and
+   always marked with `…`. The two JSON prints of the review (`task-edit-review
+   --json` and the offer review) pass through the same escaping for everything
+   `serde_json` leaves raw, so DEL, C1 controls and the list above appear as
+   `\uXXXX` and the output stays valid JSON with the same value. Other JSON
+   the CLI prints, such as `task-write-status`, is not passed through it.
+5. **Historical actions.** A v1 whole-file action shows paths, hashes and sizes
+   only, never its replacement bytes.
+
 ### Protocol examples
 
 In this table `\n`/`\r\n` denote decoded newlines, and every file supplies the

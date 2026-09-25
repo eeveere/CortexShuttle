@@ -4,6 +4,7 @@
 mod apply;
 pub mod text;
 
+pub(crate) use apply::PATCH_PREPARED;
 pub use apply::{PatchFault, PatchStage};
 
 use std::{

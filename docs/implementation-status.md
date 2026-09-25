@@ -996,7 +996,8 @@ cites the review's R1, and its test counts grew to 22 decoder and 6 mock-HTTP
 tests. No separate review record is retained.
 
 Chunk 4 (2026-09-24, split into 4a–4d) connects the v2 protocol to the
-workspace. Its fresh-task adversarial review is pending.
+workspace. Its fresh-task adversarial review ran, its fixes are applied, and
+the operator accepted it on 2026-09-24.
 
 - **4a:** a read commits only if the exact next request still fits. The
   excerpt is shortened if necessary. If even a minimal excerpt cannot fit, the
@@ -1039,6 +1040,31 @@ point, and mutation checks confirm that the key guards are pinned.
 
 Nothing has been observed against a real llama.cpp yet (Chunk 7). The gates
 are recorded in the plan.
+
+Chunk 5 (2026-09-24) adds the operator review surfaces for v2 edits
+(`src/edit_review.rs`). It is a read-only projection: no stored byte or
+authority changed.
+
+- The terminal task view, the new `task-edit-review [--json]` command and the
+  task acceptance offer now show the session ledger (turns, reads, refusals,
+  rejected turns) and the edit itself: file and hunk counts, pre/post hashes and
+  sizes, the exact compact hunks, and the read-back result per file.
+- Prepared, cancelled and unknown actions say what did and did not happen. An
+  unknown action also adds an inspect-the-workspace line to the pending list.
+- Saved text is escaped and every rendered size is capped with an explicit
+  marker. Historical whole-file actions render as file summaries only.
+- The offer confirmation prompt said "review the exact task edit above" but the
+  offer showed only IDs. It now prints the edit first. Ctrl+R on a general-task
+  offer called the generic offer review, which cannot find a task offer. It now
+  prints the task offer review.
+- The action list now reads "text patch, N file(s), M hunk(s)" or "whole-file
+  write, N file(s) (historical)".
+
+Chunk 5's Sonnet : high review ran the same day and its fixes (R5-1 escape
+set and terminal-safe JSON, R5-2 reason cut marker, R5-3 doc scope and a
+real older-journal test, R5-4 unrecorded read-back line, R5-5 dead arm) are
+applied. The operator accepted Chunk 5 on 2026-09-25. That acceptance does not
+satisfy Chunk 6's independent audit or Chunk 7's live qualification.
 
 ## Milestone 3 scope check (2026-09-21)
 

@@ -1052,4 +1052,20 @@ async fn a_read_that_cannot_fit_is_refused_and_only_a_patch_can_follow() {
     assert!(closed.terminal_reason.is_some());
     assert_eq!(closed.reads_closed_reason, saved.reads_closed_reason);
     journal.close().await;
+
+    // The operator's session review names the refusal and its reason.
+    let reader = workspace::TaskReader::open(&harness.state).await.unwrap();
+    let review = reader.edit_review().await.unwrap().unwrap();
+    reader.close().await;
+    let text = review.lines().join(
+        "
+",
+    );
+    assert!(
+        text.contains(&format!("turn {refused_turn}: read refused (")),
+        "{text}"
+    );
+    assert!(text.contains("only a patch can follow"), "{text}");
+    assert!(text.contains("  reads closed: "), "{text}");
+    assert!(text.contains("  closed: "), "{text}");
 }

@@ -149,6 +149,18 @@ reason without migrating or changing journal state. After review, a caller may u
 tool; it stores only a human permission record. `task-write-revoke` irreversibly
 withdraws that record.
 
+`task-edit-review --state-dir <task>` shows what an admitted v2 edit changed, or
+why it was blocked, from saved state alone: the session ledger (turns, reads,
+refusals, rejected turns), then the edit's file and hunk counts, pre/post
+hashes and sizes, the exact compact hunks, and whether each file's read-back
+hash matched. Prepared, cancelled and unknown actions say plainly what did and
+did not happen. Saved text is escaped: every control character and a fixed list
+of bidirectional, zero-width, tag and other invisible characters is shown as a
+`\u{..}` escape (the exact list is in S033's Chunk 5 clarification, item 4). The
+`--json` output and the offer review's JSON pass through the same escaping. The same lines appear in the terminal task
+view and, with the full hunks, in `task-offer-review`. Historical whole-file
+actions render as file summaries only.
+
 The record is bound to one proposal request and snapshot. Paths must be nonempty,
 UTF-8, workspace-relative normal components; absolute, parent-traversing and
 duplicate paths are rejected. There is no time-based expiry, but re-admission

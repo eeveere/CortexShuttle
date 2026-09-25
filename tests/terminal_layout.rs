@@ -1,3 +1,5 @@
+use cortex_shuttle::edit_review::{EditProtocol, EditReview, FileReview};
+use cortex_shuttle::journal::ResolvedWorkspaceTextHunk;
 use cortex_shuttle::ui::{MAX_INPUT_BYTES, PreviewModel};
 use cortex_shuttle::ui::{
     PreviewState, TaskView, TaskWorkspace, TaskWorkspaceEvent, render, render_task,
@@ -351,4 +353,135 @@ fn changed_or_unavailable_task_cancels_confirmation_and_repeat_cannot_start() {
         workspace.handle(start()),
         Some(TaskWorkspaceEvent::RunScripted("run-1".into()))
     );
+}
+
+fn edit_review(state: cortex_shuttle::journal::ActionState, blocked: Option<&str>) -> EditReview {
+    EditReview {
+        protocol: EditProtocol::TextPatchV2,
+        action_id: "run-1/admitted-text-patch/session".into(),
+        state,
+        blocked: blocked.map(str::to_owned),
+        files: vec![FileReview {
+            path: "AGENTS.md".into(),
+            pre_hash: "a".repeat(64),
+            post_hash: "b".repeat(64),
+            pre_size_bytes: Some(11_702),
+            post_size_bytes: 11_744,
+            observed_post_hash: blocked.is_none().then(|| "b".repeat(64)),
+            hunks: vec![ResolvedWorkspaceTextHunk {
+                start: 812,
+                end: 845,
+                old_utf8: "Run cargo test before every commit.\n".into(),
+                new_utf8: "Run cargo test --locked before every commit.\r\n".into(),
+            }],
+        }],
+        hunk_count: 1,
+        limitations: vec!["Each target is written in place.".into()],
+    }
+}
+
+/// Every distinct screen of the task history at one terminal size, scrolled
+/// from the top until the review has passed.
+fn history_screens(task: TaskView, width: u16, height: u16) -> Vec<Vec<String>> {
+    let mut workspace = TaskWorkspace::new(task);
+    let mut screens = Vec::new();
+    for _ in 0..24 {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| render_task_workspace(frame, &workspace, false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        screens.push(
+            (0..height)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect(),
+        );
+        workspace.handle(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)));
+    }
+    screens
+}
+
+fn everything_seen(screens: &[Vec<String>]) -> String {
+    screens
+        .iter()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn the_edit_review_is_readable_at_narrow_and_normal_terminal_sizes() {
+    use cortex_shuttle::journal::ActionState;
+    let cases = [
+        (
+            edit_review(ActionState::Succeeded, None),
+            vec![
+                "SUCCEEDED",
+                "AGENTS.md",
+                "@@ bytes 812..845",
+                "cargo test --locked",
+                "matches",
+                "bbbbbbbbbbbb",
+            ],
+        ),
+        (
+            edit_review(
+                ActionState::Unknown,
+                Some("Outcome unknown: inspect the workspace."),
+            ),
+            vec!["UNKNOWN", "BLOCKED", "Outcome unknown", "inspect"],
+        ),
+    ];
+    for (review, expected) in cases {
+        let task = TaskView {
+            phase: "paused".into(),
+            objective: "Update the testing guidance".into(),
+            general_workflow: true,
+            review: review.lines(),
+            ..TaskView::default()
+        };
+        for (width, height) in [(42, 18), (60, 24), (80, 24), (120, 36)] {
+            let screens = history_screens(task.clone(), width, height);
+            for screen in &screens {
+                assert!(
+                    screen
+                        .iter()
+                        .all(|row| row.chars().count() == width as usize)
+                );
+            }
+            let seen = everything_seen(&screens);
+            for token in &expected {
+                assert!(
+                    seen.contains(token),
+                    "{width}x{height}: {token:?} never appears on screen"
+                );
+            }
+            // Control characters in saved text are shown escaped, never raw.
+            assert!(!seen.contains('\r') && !seen.contains('\u{1b}'));
+        }
+    }
+}
+
+#[test]
+fn an_edit_review_with_hostile_saved_text_never_emits_raw_controls() {
+    use cortex_shuttle::journal::ActionState;
+    let mut review = edit_review(ActionState::Succeeded, None);
+    review.files[0].hunks[0].old_utf8 = "\u{1b}[2J\u{1b}]0;owned\u{7}\u{202e}evil\n".into();
+    review.files[0].path = "src/\u{1b}[31mred.rs".into();
+    let lines = review.lines();
+    assert!(
+        lines
+            .iter()
+            .all(|line| !line.chars().any(|c| c.is_control()))
+    );
+    let task = TaskView {
+        phase: "ready".into(),
+        general_workflow: true,
+        review: lines,
+        ..TaskView::default()
+    };
+    let seen = everything_seen(&history_screens(task, 80, 24));
+    assert!(seen.contains("\\u{1b}"), "the escape is spelled out");
+    assert!(!seen.chars().any(|c| c == '\u{1b}' || c == '\u{202e}'));
 }

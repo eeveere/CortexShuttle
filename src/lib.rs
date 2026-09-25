@@ -3,6 +3,7 @@ pub mod accounting;
 pub mod adapter;
 pub mod consolidation;
 pub mod controller;
+pub mod edit_review;
 pub mod edit_session;
 pub mod evidence;
 pub mod fixture;

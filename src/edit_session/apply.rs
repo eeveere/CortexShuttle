@@ -43,7 +43,7 @@ use crate::{
     },
 };
 
-const PATCH_PREPARED: &str =
+pub(crate) const PATCH_PREPARED: &str =
     "Patch prepared as a workspace action; the session is closed to further inference";
 
 /// A point in patch application at which a test may inject a fault. Not part
