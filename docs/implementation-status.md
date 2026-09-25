@@ -1066,6 +1066,69 @@ real older-journal test, R5-4 unrecorded read-back line, R5-5 dead arm) are
 applied. The operator accepted Chunk 5 on 2026-09-25. That acceptance does not
 satisfy Chunk 6's independent audit or Chunk 7's live qualification.
 
+Chunk 6 (2026-09-25) consolidates documentation, tests and the gates. It
+adds no capability and changes no stored byte.
+
+- `docs/llama-adapter.md`'s patch section now describes the v2 protocol, not
+  v1, and scopes the streamed-transport section to the fixture and planning
+  protocols. S033's opening no longer says "not an implemented capability".
+  It says the protocol is implemented against mock workers and is not yet
+  qualified live.
+- New tests: a historical v1 whole-file edit still offers, accepts and
+  finalizes and its review shows no replacement bytes; a saved v1 edit action
+  blocks a v2 session before any POST; a linked parent directory (symlink on
+  Linux, junction on Windows) never yields outside bytes. That test fails
+  closed at the run's snapshot check, so it shows the read is refused. It does
+  not isolate the per-component link check. (Corrected by the audit, A6, in
+  the entry below.)
+- Path rules: a spelling table for `canonical_text_patch_path` found two gaps
+  in the Windows reserved-name check. `CON .txt` (a space before the dot) and
+  superscript-digit names were accepted. Both are now refused. This only
+  tightens. A mutation check confirmed that the table fails without the fix.
+  (The first version of this entry called the table "exhaustive". It is not.)
+- Gates on the final tree: Windows 259 passed, Docker Linux 264 passed, none
+  failed, 10 ignored. The independent Opus : high audit is still pending, and
+  so is Chunk 7.
+
+The Chunk 6 independent audit (Opus : high, 2026-09-25) re-observed both gates
+and found no safety defect. It did find four required fixes and four smaller
+items. All eight are applied:
+- **A1.** The session's refusal of a run holding a saved v1 edit *request*
+  had no test. With the check deleted, every test still passed.
+  `a_saved_v1_edit_request_alone_blocks_a_v2_session_before_any_inference`
+  now covers it.
+- **A2.** `docs/llama-adapter.md` had repeated "a failure before the started
+  marker cancels", the overclaim that review R4-2 corrected, and had dropped
+  the Windows archive-attribute exception. Both now follow S033.
+- **A3.** `task-edit-review` told the retained r4 run "No admitted edit has
+  been attempted", although r4's v1 request reached the worker. It now reports
+  recorded v1 edit requests, using the new `TaskReader::legacy_edit_requests`.
+- **A4.** The historical v1 test's fixture did not match what the removed
+  executor stored. The test now writes the executor's exact rows: the grant,
+  the v1 request and its reply, action ID, grant revision 2, the pre-edit
+  input hash and the artifact. Its only reduction is that the saved request
+  keeps just its `protocol` field. The action-only refusal test keeps a
+  deliberately synthetic fixture, labelled as such. A real v1 action always
+  has its request, and the request check refuses first.
+- **A5.** `CONIN$` and `CONOUT$` are now refused too. The reserved-name comment
+  now says the list is defensive and records what was observed on Windows 11.
+- **A6.** The linked-parent test now asserts the link refusal and also uses a
+  byte-identical outside copy, which only the link check can refuse. A
+  linked-workspace-root test was added. The refusal comes from the
+  per-component check that runs inside the snapshot capture. The edit path's
+  own copy of that check is still untested in isolation. It is redundant with
+  the handle-identity and admitted-hash checks.
+- **A7 and A8.** The v1-action test now asserts its exact message, and S033's
+  opening dates are corrected.
+
+Gates on the fixed tree are recorded in the plan's audit section. The audit's
+focused re-check (Opus : high, a separate session, 2026-09-25) passed. It
+found two Low items, both fixed: `task-edit-review`'s v1 sentence
+now says only `run-status` lists the requests (RC-1), and the v1 request
+fixture now pauses the run as the removed executor did (RC-2). The operator
+accepted Chunk 6 on 2026-09-25. Chunk 7, the live qualification, is still
+pending.
+
 ## Milestone 3 scope check (2026-09-21)
 
 The master plan (`docs/.shuttle-priv/dedicated-harness-plan.md`, moved here

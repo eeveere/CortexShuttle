@@ -102,6 +102,20 @@ impl TaskEditReview {
     }
 }
 
+/// What to print when there is no edit review: no v2 session and no edit
+/// action. A journal can still hold historical v1 whole-file edit requests
+/// that failed before any action (the retained r4 run), so this must not
+/// claim that no edit was attempted (Chunk 6 audit A3).
+pub fn no_edit_review_line(legacy_edit_requests: u64) -> String {
+    if legacy_edit_requests == 0 {
+        "No admitted edit has been attempted for this task.".into()
+    } else {
+        format!(
+            "No v2 edit session or edit action is recorded. This task holds {legacy_edit_requests} historical v1 whole-file edit request(s) and no edit action; `run-status` lists them."
+        )
+    }
+}
+
 /// Characters that are not controls but still change how text is displayed or
 /// hide it: bidirectional marks and overrides, zero-width and joiner
 /// characters, line and paragraph separators, soft hyphen, variation

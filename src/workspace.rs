@@ -1724,12 +1724,26 @@ pub(crate) async fn current_write_permission_view(
 
 impl TaskReader {
     /// Bounded review of the admitted edit session and its latest change, read
-    /// from saved state only. `None` when the task never had an edit.
+    /// from saved state only. `None` when the journal holds no v2 edit
+    /// session and no edit action. That does not mean no edit was attempted:
+    /// see `legacy_edit_requests`.
     pub async fn edit_review(&self) -> Result<Option<crate::edit_review::TaskEditReview>> {
         let mut tx = self.pool.begin().await?;
         let review = crate::edit_review::load_task_edit_review(&mut tx).await?;
         tx.commit().await?;
         Ok(review)
+    }
+
+    /// Number of saved historical v1 whole-file edit requests (S029). A v1
+    /// request that failed before any action, like the retained r4 run, has
+    /// no edit review, but it was still an edit attempt (Chunk 6 audit A3).
+    pub async fn legacy_edit_requests(&self) -> Result<u64> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM model_requests WHERE json_extract(intent_json, '$.purpose') LIKE 'admitted\\_task\\_edit\\_v1:%' ESCAPE '\\'",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(u64::try_from(count)?)
     }
 
     /// Read the current proposal and any durable permission without migrating,
@@ -1938,10 +1952,20 @@ fn validate_patch_identity_component(value: &str, name: &str) -> Result<()> {
 }
 
 fn reserved_windows_component(component: &str) -> bool {
+    // Defensive superset of the documented reserved names. Observed on
+    // Windows 11 build 22631 (Chunk 6 audit A5): from an absolute path, which
+    // is how targets are opened, only bare `NUL` resolves to a device. As a
+    // bare relative name, `CON`, `COM¹`, `CONIN$` and `CONOUT$` are devices,
+    // but `CON .txt` is not. Older Windows versions treat more of these forms
+    // as devices, and Python's `os.path.isreserved` also treats `CON .txt` as
+    // reserved, so trailing spaces and dots are trimmed from the stem, and
+    // superscript digits count like ASCII ones. Refusing more only tightens.
     let stem = component
         .trim_end_matches(['.', ' '])
         .split_once('.')
         .map_or(component, |(stem, _)| stem)
+        .trim_end_matches(['.', ' '])
+        .replace(['\u{b9}', '\u{b2}', '\u{b3}'], "1")
         .to_ascii_uppercase();
     matches!(
         stem.as_str(),
@@ -1967,6 +1991,8 @@ fn reserved_windows_component(component: &str) -> bool {
             | "LPT7"
             | "LPT8"
             | "LPT9"
+            | "CONIN$"
+            | "CONOUT$"
     )
 }
 
@@ -2890,4 +2916,82 @@ pub async fn run_demo(state_dir: &Path, expected_run: Option<&str>) -> Result<()
     .await;
     controller.journal.close().await;
     result
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::canonical_text_patch_path;
+
+    /// S033 path rules: every spelling here must be refused, on every
+    /// platform, because a grant key is one canonical slash-separated form.
+    #[test]
+    fn unsafe_spellings_are_never_canonical_grant_keys() {
+        let long = format!("{}/x", "a".repeat(1_100));
+        for path in [
+            "",
+            "/etc/passwd",
+            "//server/share/x",
+            "C:/x",
+            "c:x",
+            "a/../b",
+            "../a",
+            "a/./b",
+            "a//b",
+            "a/",
+            "./a",
+            "a\x5cb",
+            "\x5c\x5cserver\x5cshare\x5cx",
+            "a\0b",
+            "a\nb",
+            "a\tb",
+            "a:stream",
+            "a/b.txt:$DATA",
+            "a/b.",
+            "a/b ",
+            "a/b. ",
+            "con",
+            "a/NUL",
+            "a/nul",
+            "a/Aux.txt",
+            "a/prn.tar.gz",
+            "a/COM1",
+            "a/com9.rs",
+            "a/LPT1",
+            "a/lpt9.x",
+            "a/CON .txt",
+            "a/con...txt",
+            "a/COM\u{b9}",
+            "a/LPT\u{b2}.txt",
+            "a/COM\u{b3}",
+            "a/CONIN$",
+            "a/conout$.txt",
+            long.as_str(),
+        ] {
+            assert!(
+                canonical_text_patch_path(path).is_err(),
+                "accepted {path:?}"
+            );
+        }
+    }
+
+    /// Names that merely resemble reserved ones stay valid, and no case
+    /// folding or normalization is applied to a valid spelling.
+    #[test]
+    fn ordinary_names_pass_through_unchanged() {
+        for path in [
+            "AGENTS.md",
+            "src/main.rs",
+            "src/Console.rs",
+            "src/com10.rs",
+            "src/nullable.rs",
+            "src/lpt.rs",
+            "src/conin.rs",
+            "src/COM\u{2074}.txt",
+            "src/auxiliary/x.txt",
+            "docs/\u{e9}t\u{e9}.md",
+            ".github/workflows/ci.yml",
+        ] {
+            assert_eq!(canonical_text_patch_path(path).unwrap(), path);
+        }
+    }
 }

@@ -1111,6 +1111,7 @@ async fn run_command(command: Box<Command>) -> Result<()> {
         Command::TaskEditReview { state_dir, json } => {
             let reader = TaskReader::open(&state_dir).await?;
             let review = reader.edit_review().await?;
+            let legacy = reader.legacy_edit_requests().await?;
             reader.close().await;
             match (review, json) {
                 (Some(review), true) => println!(
@@ -1118,8 +1119,9 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                     edit_review::json_terminal_safe(&serde_json::to_string_pretty(&review)?)
                 ),
                 (Some(review), false) => review.lines().iter().for_each(|line| println!("{line}")),
+                // JSON `null` means only "no v2 session and no edit action".
                 (None, true) => println!("null"),
-                (None, false) => println!("No admitted edit has been attempted for this task."),
+                (None, false) => println!("{}", edit_review::no_edit_review_line(legacy)),
             }
         }
         Command::TaskWriteGrant {

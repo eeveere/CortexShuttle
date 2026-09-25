@@ -1069,3 +1069,110 @@ async fn a_read_that_cannot_fit_is_refused_and_only_a_patch_can_follow() {
     assert!(text.contains("  reads closed: "), "{text}");
     assert!(text.contains("  closed: "), "{text}");
 }
+
+/// Link `link` to the directory `target`: a symlink on Unix, a junction on
+/// Windows. Neither needs elevated rights beyond the ordinary test setup.
+fn link_directory(link: &Path, target: &Path) {
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// Remove only the link itself, never its target.
+fn unlink_directory(link: &Path) {
+    #[cfg(unix)]
+    fs::remove_file(link).unwrap();
+    #[cfg(windows)]
+    fs::remove_dir(link).unwrap();
+}
+
+/// Replace the declared `src` directory with a link to an outside directory.
+/// The outside copy is byte-identical to the declared files, so no hash
+/// comparison can tell it apart and only the per-component link check can
+/// refuse it; a second pass gives the outside `main.rs` different bytes. Both
+/// must fail closed with the link refusal, store no observation and never
+/// return outside bytes. (Rust reports a Windows junction as a symlink.)
+#[tokio::test]
+async fn a_linked_parent_directory_never_yields_outside_bytes() {
+    for identical in [true, false] {
+        let harness = Harness::new(&["src/main.rs"]).await;
+        let mut journal = harness.journal().await;
+        let session = harness.open_session(&mut journal).await;
+        let outside = tempdir().unwrap();
+        for name in ["main.rs", "other.rs", "blob.rs"] {
+            let bytes = fs::read(harness.workspace.join("src").join(name)).unwrap();
+            fs::write(outside.path().join(name), bytes).unwrap();
+        }
+        if !identical {
+            fs::write(
+                outside.path().join("main.rs"),
+                "OUTSIDE-SECRET\n".repeat(60),
+            )
+            .unwrap();
+        }
+        fs::rename(
+            harness.workspace.join("src"),
+            harness.workspace.join("src-real"),
+        )
+        .unwrap();
+        let link = harness.workspace.join("src");
+        link_directory(&link, outside.path());
+        let result = read_turn(&mut journal, &session, read_main(1, 5)).await;
+        // Remove the link before asserting, so a failure cannot leave the
+        // outside directory reachable from the temporary workspace.
+        unlink_directory(&link);
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("symlink path is not allowed"), "{error}");
+        assert!(!error.contains("OUTSIDE-SECRET"), "{error}");
+        assert!(
+            journal
+                .admitted_read_history(&session.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no observation may be stored"
+        );
+        assert_eq!(journal.run().await.unwrap().unwrap().phase, "paused");
+        journal.close().await;
+    }
+}
+
+/// A link at the workspace root itself, pointing back at the real, unchanged
+/// workspace, is refused the same way: every component is checked, not only
+/// the declared ones.
+#[tokio::test]
+async fn a_linked_workspace_root_is_refused() {
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    let real = harness.workspace.with_file_name("workspace-real");
+    fs::rename(&harness.workspace, &real).unwrap();
+    link_directory(&harness.workspace, &real);
+    let result = read_turn(&mut journal, &session, read_main(1, 5)).await;
+    unlink_directory(&harness.workspace);
+    fs::rename(&real, &harness.workspace).unwrap();
+    let error = format!("{:#}", result.unwrap_err());
+    assert!(error.contains("symlink path is not allowed"), "{error}");
+    assert!(
+        journal
+            .admitted_read_history(&session.id)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no observation may be stored"
+    );
+    journal.close().await;
+}

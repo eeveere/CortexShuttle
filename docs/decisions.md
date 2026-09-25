@@ -583,9 +583,15 @@ acceptance or finalization from display state.
 
 ## S033 — Apply bounded exact text hunks under a versioned admitted-edit contract
 
-2026-09-16. Accepted design for the next implementation chunks; **not an
-implemented capability**. This supersedes S029's whole-file wire representation
-for future admitted edits only. S015's exact-byte principle and S028–S032's human
+2026-09-16. Accepted design. Implemented against mock workers in Chunks 1-5
+(2026-09-16 to 2026-09-25) and reviewed chunk by chunk, except Chunk 2a, a
+mechanical build gate with no reviewer by design. **Not yet qualified against
+a live worker** (Chunk 7). Chunk 6's independent audit found required fixes.
+They were applied, a separate focused re-check passed after two small fixes,
+and the operator accepted Chunk 6 (all 2026-09-25).
+The sections below are the frozen contract, and the dated clarifications record
+what implementation settled. This supersedes S029's whole-file wire
+representation for future admitted edits only. S015's exact-byte principle and S028–S032's human
 authority, durability, verification and review gates remain in force. Fixture v5
 and admitted planning v1 keep their existing semantics. Terminal lifecycle changes
 are outside this decision.
@@ -1078,6 +1084,28 @@ authority and changes no stored bytes; it only says what the reader may show.
    the CLI prints, such as `task-write-status`, is not passed through it.
 5. **Historical actions.** A v1 whole-file action shows paths, hashes and sizes
    only, never its replacement bytes.
+
+Clarification (2026-09-25, Chunk 6). Path rule 2 now also refuses three more
+forms:
+- a reserved device name whose stem has trailing spaces or dots before the
+  extension (`CON .txt`);
+- the superscript-digit forms of `COM` and `LPT`;
+- `CONIN$` and `CONOUT$` (added by the Chunk 6 audit, A5).
+
+All are refusals only. No grant, limit or stored byte was widened. The list is
+a defensive superset. On Windows 11 build 22631, from an absolute path, which
+is how targets are opened, only bare `NUL` resolves to a device. As a bare
+relative name, `CON`, `COM¹`, `CONIN$` and `CONOUT$` do, and `CON .txt` does
+not. Older Windows versions, and Python's `os.path.isreserved`, treat more of
+these forms as reserved.
+
+Clarification (2026-09-25, Chunk 6 audit A3). A journal can hold historical v1
+edit requests that failed before any action, as the retained r4 run does.
+Such a journal has no edit review, since there is no v2 session and no edit
+action. So `task-edit-review` reports the recorded v1 requests instead of
+saying no edit was attempted, and its `--json` `null` means only "no v2
+session and no edit action". The count is a read-only query on saved
+requests, through `TaskReader`.
 
 ### Protocol examples
 

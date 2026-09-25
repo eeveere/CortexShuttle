@@ -41,6 +41,9 @@ literal escape characters. See decision S015 and [live repair](live-repair.md).
 
 ## Bounded stream and result
 
+This section describes the streamed transport used by the fixture and admitted-planning
+protocols. The admitted-editing v2 protocol below is non-streamed.
+
 The client consumes streamed response bytes into a bounded artifact, then validates
 the complete SSE stream before exposing a proposal. It requires matching model
 identity, a stable response identity and tool-call identity, one choice/call,
@@ -159,26 +162,84 @@ of bidirectional, zero-width, tag and other invisible characters is shown as a
 `\u{..}` escape (the exact list is in S033's Chunk 5 clarification, item 4). The
 `--json` output and the offer review's JSON pass through the same escaping. The same lines appear in the terminal task
 view and, with the full hunks, in `task-offer-review`. Historical whole-file
-actions render as file summaries only.
+actions render as file summaries only. Some tasks hold only a historical v1
+edit request that failed before any action was prepared, like the retained r4
+run. Such a task has no review, and `task-edit-review` says a v1 request is
+recorded rather than that no edit was attempted. With `--json` it prints
+`null`, which means only that the task has no v2 session and no edit action.
 
 The record is bound to one proposal request and snapshot. Paths must be nonempty,
 UTF-8, workspace-relative normal components; absolute, parent-traversing and
 duplicate paths are rejected. There is no time-based expiry, but re-admission
 stales old permission and a current declared-input mismatch makes it unusable.
-This still is not an edit protocol: a later phase must reject links/reparse points
-and revalidate these bindings immediately before writing durable edit intent.
+The grant is not itself an edit: the edit protocol below rejects links and reparse
+points and revalidates these bindings before it prepares an action and again
+immediately before its first write.
 
 ## Admitted-task patch protocol
 
 `task-edit --state-dir <task> --profile <worker.json>` uses
-`shuttle-llama-admitted-editing-v1` only after a current write permission exists.
-Its sole tool returns one bounded list of `{path, expected_hash, utf8_bytes}`
-replacements. Paths must be within the granted set and identify existing declared
-regular files; additions and deletions are not supported. Shuttle stores the model
-reply and the prepared action atomically, marks the action started before writing,
-and never replays an unknown completion. The same local worker profile identity is
-used for planning and patching; the persisted serialized request still binds the
-specific protocol.
+`shuttle-llama-admitted-editing-v2` (decision S033) only after a current write
+permission exists. The provider identity is
+`shuttle-llama-admitted-editing-v2:<profile_digest>`, and the adapter is bound to
+one durable edit session. The same worker profile as planning is used; the saved
+request binds the specific protocol. The request is non-streamed
+(`stream:false`) and the response must be identity-encoded `application/json`
+within the unchanged 64 KiB per-artifact cap.
+
+The model gets at most five turns, each a durable, started-before-POST request
+with exactly one tool call:
+
+- `read_task_text {path, start_line, line_count}`: up to 128 lines of a granted,
+  declared UTF-8 file;
+- `find_task_text {path, literal}`: exact literal search, at most eight matches;
+- `record_task_patch {files: [{path, expected_file_hash, hunks: [{old_utf8,
+  new_utf8}]}]}`: the compact patch.
+
+At most four reads succeed, with 2,048 excerpt bytes each and 6,144 in total.
+Read tools are offered only while a read can still succeed, and the fifth turn
+offers only the patch. Observations are saved and replayed byte for byte, never
+reread. A read whose next request would not fit is shortened, or refused with the
+session kept open for a patch.
+
+A hunk's `old_utf8` must occur exactly once in the admitted preimage (overlapping
+matches count), and all hunks resolve against that same preimage with no fuzzy
+matching. A patch is limited to 8 files, 16 hunks per file (64 total) and 4,096
+bytes of old plus new text, so the reply is proportional to the changed text,
+not the file. The decoder parses the response as typed structures, rejects
+duplicate and unknown fields in every argument object, and never unescapes text a
+second time.
+
+The patch reply and its prepared `PatchWorkspaceFiles` action commit together
+before any write. Application re-checks permission, the full declared snapshot
+and every target's path and handle, commits the started marker, then writes each
+target in place through its validated handle, reads it back, and records success
+only if the post-write snapshot equals the predicted one. There is one
+exception, on Windows only: the ARCHIVE and NORMAL attributes of the patched
+files are left out of that comparison, because NTFS sets the archive bit on an
+in-place write (S033's Chunks 4b-4d clarification, item 4). Every other
+attribute and every unpatched file must match exactly.
+
+If one of application's own checks fails before the started marker, the
+action is cancelled, and a cancelled action is never resumed. The run-level
+guards inside the journal's `start` are the exception: acceptance seal,
+execution budget or stall, a pending model request, or a run that is not
+ready. Failing one of them leaves the action `prepared`, and it resumes once
+the condition clears (same clarification, item 2). Any failure after the
+started marker is `unknown`. A started write is never retried, rolled back or
+replayed, and a cancelled or unknown outcome needs a fresh task state. This is
+journal-level transactional preparation, not a multi-file
+filesystem transaction: a concurrent writer can race the checks, and the
+comparison is a boundary observation rather than an atomic snapshot.
+
+A session that fails any turn (transport, decoder or domain rejection, drift,
+exhausted budget) closes, pauses the run and keeps its evidence. It is not
+reopened; continuing needs a fresh task state with a new admission and grant. A
+run that holds any saved v1 whole-file edit request or action cannot start a v2
+session. Nothing generates v1 edit requests any more, and historical whole-file
+actions remain readable, offerable and reviewable as file summaries. The v2
+protocol is implemented against mock workers only. No live worker qualification
+has been run yet.
 
 After a successful patch, declared inputs no longer match the old admission. Run
 the explicit `task-readmit`, then `task-verify-all` and `task-verify-evidence` to
