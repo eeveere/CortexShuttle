@@ -10,7 +10,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use cortex_shuttle::{
     edit_session::text::TextReadOperation,
-    edit_session::{AdmittedEditSession, EDIT_PROTOCOL},
+    edit_session::{
+        AdmittedEditSession, AdmittedEditTurnContext, AdmittedReadCommit, EDIT_PROTOCOL,
+        parse_edit_model_context,
+    },
     journal::Journal,
     model::{Decision, ModelContext, ModelProvider, ModelReply},
     process::{ProcessLimits, ProcessSpec, hash_executable},
@@ -132,12 +135,20 @@ struct Harness {
 impl Harness {
     /// Intake, preflight, admission, planning and an explicit human write grant.
     async fn new(proposed: &[&str]) -> Self {
+        Self::with_files(proposed, &[]).await
+    }
+
+    /// `new`, plus extra declared files written before preflight.
+    async fn with_files(proposed: &[&str], extra: &[(&str, &[u8])]) -> Self {
         let root = tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let state = root.path().join("task");
         fs::create_dir(&workspace).unwrap();
         fs::create_dir(workspace.join("src")).unwrap();
         fs::write(workspace.join("src/main.rs"), declared_source()).unwrap();
+        for (path, bytes) in extra {
+            fs::write(workspace.join(path), bytes).unwrap();
+        }
         // Declared, never granted: used to prove full-snapshot freshness.
         fs::write(
             workspace.join("src/other.rs"),
@@ -201,19 +212,36 @@ fn read_reply(operation: TextReadOperation) -> RequestResult {
 }
 
 /// One complete durable turn: reserve, start, then commit or reject the reply.
-async fn read_turn(
+async fn read_commit(
     journal: &mut Journal,
     session: &AdmittedEditSession,
     operation: TextReadOperation,
-) -> Result<cortex_shuttle::edit_session::AdmittedTextObservation> {
+) -> Result<AdmittedReadCommit> {
     let editor = Editor::new();
     let record = journal
         .prepare_admitted_edit_turn(&session.id, &editor)
         .await?;
     journal.start_admitted_edit_turn(&record.id).await?;
     journal
-        .finish_admitted_text_read(&record.id, &read_reply(operation), &[b"raw".to_vec()])
+        .finish_admitted_text_read(
+            &record.id,
+            &read_reply(operation),
+            &[b"raw".to_vec()],
+            &editor,
+        )
         .await
+}
+
+/// `read_commit` for a read that must be observed rather than refused.
+async fn read_turn(
+    journal: &mut Journal,
+    session: &AdmittedEditSession,
+    operation: TextReadOperation,
+) -> Result<cortex_shuttle::edit_session::AdmittedTextObservation> {
+    Ok(read_commit(journal, session, operation)
+        .await?
+        .observed()
+        .expect("the read was refused rather than observed"))
 }
 
 fn read_main(start_line: u64, line_count: u64) -> TextReadOperation {
@@ -351,7 +379,12 @@ async fn drift_after_start_is_caught_at_the_read_boundary() {
     .unwrap();
 
     let error = journal
-        .finish_admitted_text_read(&record.id, &read_reply(read_main(38, 5)), &[])
+        .finish_admitted_text_read(
+            &record.id,
+            &read_reply(read_main(38, 5)),
+            &[],
+            &Editor::new(),
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -695,13 +728,13 @@ async fn a_successful_replay_is_rejected_without_closing_the_session() {
     journal.start_admitted_edit_turn(&record.id).await.unwrap();
     let reply = read_reply(read_main(38, 5));
     journal
-        .finish_admitted_text_read(&record.id, &reply, &[])
+        .finish_admitted_text_read(&record.id, &reply, &[], &Editor::new())
         .await
         .unwrap();
     assert_eq!(journal.run().await.unwrap().unwrap().phase, "ready");
 
     let error = journal
-        .finish_admitted_text_read(&record.id, &reply, &[])
+        .finish_admitted_text_read(&record.id, &reply, &[], &Editor::new())
         .await
         .unwrap_err()
         .to_string();
@@ -763,7 +796,12 @@ async fn an_unknown_settled_request_still_leaves_the_session_closed() {
     );
 
     let error = journal
-        .finish_admitted_text_read(&record.id, &read_reply(read_main(38, 5)), &[])
+        .finish_admitted_text_read(
+            &record.id,
+            &read_reply(read_main(38, 5)),
+            &[],
+            &Editor::new(),
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -796,6 +834,7 @@ async fn oversized_provider_artifacts_pause_the_run_without_an_observation() {
             &record.id,
             &read_reply(read_main(38, 5)),
             &[vec![b'x'; 65_537]],
+            &Editor::new(),
         )
         .await
         .unwrap_err()
@@ -809,5 +848,208 @@ async fn oversized_provider_artifacts_pause_the_run_without_an_observation() {
             .is_empty()
     );
     assert_eq!(journal.run().await.unwrap().unwrap().phase, "paused");
+    journal.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 4a: size-aware read commit (Chunk 3 review R1)
+// ---------------------------------------------------------------------------
+
+/// 128 lines of 63 copies of `byte`, each ending in LF: 8,192 bytes of text
+/// whose every character expands when it is escaped into JSON.
+fn dense_text(byte: u8) -> Vec<u8> {
+    let mut line = vec![byte; 63];
+    line.push(b'\n');
+    line.repeat(128)
+}
+
+fn read_dense(start_line: u64, line_count: u64) -> TextReadOperation {
+    TextReadOperation::ReadTaskText {
+        path: "src/dense.rs".into(),
+        start_line,
+        line_count,
+    }
+}
+
+/// Prepare the next turn, which must always succeed, and report its context.
+async fn next_turn(
+    journal: &mut Journal,
+    session: &AdmittedEditSession,
+) -> (String, AdmittedEditTurnContext) {
+    let record = journal
+        .prepare_admitted_edit_turn(&session.id, &Editor::new())
+        .await
+        .expect("every turn after a committed read must be representable");
+    let (turn, history) = parse_edit_model_context(&record.intent.context).unwrap();
+    assert_eq!(history.len(), (4 - turn.remaining_reads) as usize);
+    (record.id, turn)
+}
+
+async fn finish_read(
+    journal: &mut Journal,
+    request_id: &str,
+    operation: TextReadOperation,
+) -> AdmittedReadCommit {
+    journal.start_admitted_edit_turn(request_id).await.unwrap();
+    journal
+        .finish_admitted_text_read(request_id, &read_reply(operation), &[], &Editor::new())
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn three_maximum_reads_on_ordinary_text_leave_a_patch_turn() {
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    for turn in 0..3 {
+        let observation = read_turn(&mut journal, &session, read_main(1, 128))
+            .await
+            .unwrap();
+        // Ordinary text is never shortened by R1: only the 2,048 cap applies.
+        assert_eq!(observation.result.text_bytes(), 2_048, "turn {turn}");
+    }
+    let saved = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert_eq!((saved.read_count, saved.read_bytes), (3, 6_144));
+    assert!(saved.reads_closed_reason.is_none());
+
+    let (_, turn) = next_turn(&mut journal, &session).await;
+    assert_eq!(turn.turn_index, 3);
+    assert!(!turn.reads_available() && !turn.patch_only && !turn.reads_closed);
+    journal.close().await;
+}
+
+/// A backslash costs four bytes in the durable context. Before R1 this file
+/// stranded the session on its fourth turn with "edit history exceeds request
+/// allowance": reads remained, but no further request, patch included, could
+/// be prepared. Now every turn prepares, excerpts shorten to fit, and each
+/// observation is charged exactly the bytes it returned (decision b).
+#[tokio::test]
+async fn a_backslash_dense_file_no_longer_strands_the_session() {
+    let dense = dense_text(b'\\');
+    let harness = Harness::with_files(&["src/dense.rs"], &[("src/dense.rs", &dense)]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+
+    let (mut charged, mut shortened, mut committed) = (0, 0, 0);
+    let (request_id, final_turn) = loop {
+        let (request_id, turn) = next_turn(&mut journal, &session).await;
+        if !turn.reads_available() {
+            break (request_id, turn);
+        }
+        match finish_read(&mut journal, &request_id, read_dense(1, 128)).await {
+            AdmittedReadCommit::Observed(observation) => {
+                let bytes = observation.result.text_bytes();
+                let allowance = (6_144 - charged).min(2_048);
+                if bytes < allowance {
+                    assert!(
+                        observation.result.truncated && observation.result.excerpts[0].truncated
+                    );
+                    shortened += 1;
+                }
+                charged += bytes;
+                committed += 1;
+            }
+            AdmittedReadCommit::Refused(reason) => {
+                assert!(reason.contains("Read refused"), "{reason}");
+            }
+        }
+    };
+    assert!(
+        shortened > 0,
+        "a dense file must shorten at least one excerpt"
+    );
+    let saved = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert_eq!(saved.read_bytes, charged);
+    assert_eq!(saved.read_count, committed);
+    assert!(saved.terminal_reason.is_none());
+    assert_eq!(journal.run().await.unwrap().unwrap().phase, "ready");
+    // The loop ended on a prepared, patch-capable turn.
+    assert!(!final_turn.reads_available());
+    let pending = journal
+        .model_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == request_id)
+        .unwrap();
+    assert_eq!(pending.state, "prepared");
+    journal.close().await;
+}
+
+/// A control character costs seven bytes in the durable context, so a minimal
+/// excerpt soon cannot fit. That read is refused (decision a): reads close,
+/// the request records the refusal without an observation, the session stays
+/// open and the run ready, and the very next turn is patch-only even though it
+/// is not the fifth.
+#[tokio::test]
+async fn a_read_that_cannot_fit_is_refused_and_only_a_patch_can_follow() {
+    let dense = dense_text(0x01);
+    let harness = Harness::with_files(&["src/dense.rs"], &[("src/dense.rs", &dense)]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+
+    let mut charged = 0;
+    let (refused_turn, refused_request) = loop {
+        let (request_id, turn) = next_turn(&mut journal, &session).await;
+        assert!(turn.reads_available(), "turn {}", turn.turn_index);
+        match finish_read(&mut journal, &request_id, read_dense(1, 128)).await {
+            AdmittedReadCommit::Observed(observation) => charged += observation.result.text_bytes(),
+            AdmittedReadCommit::Refused(_) => break (turn.turn_index, request_id),
+        }
+    };
+    assert!(refused_turn < 3, "refusal must leave a non-final turn");
+
+    let saved = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert!(saved.reads_closed_reason.is_some());
+    assert!(saved.terminal_reason.is_none());
+    assert_eq!(saved.read_bytes, charged);
+    assert_eq!(journal.run().await.unwrap().unwrap().phase, "ready");
+    let refused = journal
+        .model_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.id == refused_request)
+        .unwrap();
+    assert_eq!(refused.state, "succeeded");
+    assert!(refused.applied);
+    assert!(
+        refused
+            .application
+            .as_deref()
+            .unwrap()
+            .starts_with("refused_read:")
+    );
+    assert!(
+        journal
+            .admitted_read_history(&session.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|pair| pair.observation.request_id != refused_request)
+    );
+
+    let (request_id, turn) = next_turn(&mut journal, &session).await;
+    assert_eq!(turn.turn_index, refused_turn + 1);
+    assert!(turn.reads_closed && !turn.patch_only && !turn.reads_available());
+
+    // A provider that ignores the offered tools cannot reopen reads; the
+    // attempt fails closed like any other invalid reply.
+    journal.start_admitted_edit_turn(&request_id).await.unwrap();
+    let error = journal
+        .finish_admitted_text_read(
+            &request_id,
+            &read_reply(read_dense(1, 1)),
+            &[],
+            &Editor::new(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("reads are closed"), "{error}");
+    let closed = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert!(closed.terminal_reason.is_some());
+    assert_eq!(closed.reads_closed_reason, saved.reads_closed_reason);
     journal.close().await;
 }

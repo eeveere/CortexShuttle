@@ -1129,9 +1129,8 @@ async fn run_command(command: Box<Command>) -> Result<()> {
             let reader = TaskReader::open(&state_dir).await?;
             let view = reader.write_permission_view().await?;
             reader.close().await;
-            let permission = view
-                .permission
-                .clone()
+            view.permission
+                .as_ref()
                 .context("explicit write permission is required")?;
             anyhow::ensure!(
                 view.unusable_reason.is_none(),
@@ -1142,11 +1141,7 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                 .take(8193)
                 .read_to_end(&mut bytes)?;
             anyhow::ensure!(bytes.len() <= 8192, "profile exceeds bound");
-            let mut model = LlamaModel::for_admitted_editing(
-                serde_json::from_slice(&bytes)?,
-                view.context.clone(),
-                permission,
-            )?;
+            let profile: LlamaProfile = serde_json::from_slice(&bytes)?;
             let mut config = AppConfig::default();
             config.database.path = state_dir
                 .join("cortexweave.sqlite")
@@ -1156,9 +1151,13 @@ async fn run_command(command: Box<Command>) -> Result<()> {
             let native_workspace = service
                 .register_workspace(&view.admission.workspace_root, "Shuttle admitted task edit")
                 .await?;
-            let action =
-                workspace::run_admitted_task_edit(&state_dir, &native_workspace.id, &mut model)
-                    .await?;
+            let action = workspace::run_admitted_task_edit(
+                &state_dir,
+                &native_workspace.id,
+                &profile.digest()?,
+                |session| LlamaModel::for_admitted_editing_v2(profile.clone(), session.id.clone()),
+            )
+            .await?;
             println!("{}", serde_json::to_string_pretty(&action)?);
         }
         Command::TaskVerify {
@@ -1467,8 +1466,8 @@ async fn run_terminal_task_operation(
             let reader = TaskReader::open(state_dir).await?;
             let view = reader.write_permission_view().await?;
             reader.close().await;
-            let permission = view
-                .permission
+            view.permission
+                .as_ref()
                 .context("explicit write permission is required")?;
             anyhow::ensure!(
                 view.unusable_reason.is_none(),
@@ -1479,11 +1478,7 @@ async fn run_terminal_task_operation(
                 .take(8193)
                 .read_to_end(&mut bytes)?;
             anyhow::ensure!(bytes.len() <= 8192, "profile exceeds bound");
-            let mut model = LlamaModel::for_admitted_editing(
-                serde_json::from_slice(&bytes)?,
-                view.context,
-                permission,
-            )?;
+            let profile: LlamaProfile = serde_json::from_slice(&bytes)?;
             let mut config = AppConfig::default();
             config.database.path = state_dir
                 .join("cortexweave.sqlite")
@@ -1493,7 +1488,13 @@ async fn run_terminal_task_operation(
             let native_workspace = service
                 .register_workspace(&view.admission.workspace_root, "Shuttle admitted task edit")
                 .await?;
-            workspace::run_admitted_task_edit(state_dir, &native_workspace.id, &mut model).await?;
+            workspace::run_admitted_task_edit(
+                state_dir,
+                &native_workspace.id,
+                &profile.digest()?,
+                |session| LlamaModel::for_admitted_editing_v2(profile.clone(), session.id.clone()),
+            )
+            .await?;
         }
         TaskOperation::Verify => {
             anyhow::ensure!(

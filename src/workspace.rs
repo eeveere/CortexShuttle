@@ -2,10 +2,11 @@
 use crate::{
     acceptance::{LifecycleOperation, LifecycleRequest, OutboxRequest, UserChoice, UserResponse},
     controller::Bindings,
+    edit_session::{AdmittedEditSession, MAX_EDIT_TURNS},
     journal::{
-        ActionIntent, ActionRecord, ActionResult, ActionState, Grant, Journal,
-        PreparedWorkspaceFilePatch, ResolvedWorkspaceTextHunk, ToolCall, WorkspaceFileEdit,
-        WorkspaceFilePatch, WorkspaceTextPatch, enqueue_in, enqueue_outbox_in, transition,
+        ActionIntent, ActionRecord, ActionState, Grant, Journal, PreparedWorkspaceFilePatch,
+        ResolvedWorkspaceTextHunk, ToolCall, WorkspaceFilePatch, WorkspaceTextPatch, enqueue_in,
+        enqueue_outbox_in, transition,
     },
     model::{Decision, ModelContext, ModelProvider},
     requests::{RequestIntent, RequestRecord, RequestResult},
@@ -311,8 +312,6 @@ impl TaskIntake {
 }
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -546,7 +545,9 @@ impl TaskReader {
             .bind(&admission.id)
             .fetch_one(&mut *tx)
             .await?;
-            let edit_done: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions WHERE state = 'succeeded' AND intent_json LIKE '%WriteWorkspaceFiles%')")
+            // `ToolCall` is tagged `tool` in snake case. The earlier
+            // `LIKE '%WriteWorkspaceFiles%'` never matched a saved intent.
+            let edit_done: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM actions WHERE state = 'succeeded' AND json_extract(intent_json, '$.call.tool') IN ('write_workspace_files', 'patch_workspace_files'))")
                 .fetch_one(&mut *tx).await?;
             let evidence: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_suite_evidence WHERE admission_id = ? AND stale_reason IS NULL)")
                 .bind(&admission.id).fetch_one(&mut *tx).await?;
@@ -738,7 +739,7 @@ pub async fn offer_task_acceptance(
         );
         let actions = journal.actions().await?;
         ensure!(!actions.iter().any(|action| matches!(action.state, ActionState::Prepared | ActionState::Started | ActionState::Unknown)), "unfinished or unknown action blocks task acceptance offer");
-        let change = actions.iter().rev().find(|action| matches!(action.intent.call, ToolCall::WriteWorkspaceFiles { .. }) && action.result.as_ref().is_some_and(|result| result.state == ActionState::Succeeded && result.input_after_hash == evidence.evidence.snapshot_id)).context("fresh suite evidence is not bound to a successful admitted workspace edit")?;
+        let change = actions.iter().rev().find(|action| is_admitted_workspace_edit(&action.intent.call) && action.result.as_ref().is_some_and(|result| result.state == ActionState::Succeeded && result.input_after_hash == evidence.evidence.snapshot_id)).context("fresh suite evidence is not bound to a successful admitted workspace edit")?;
         let result = change.result.as_ref().context("workspace edit result missing")?;
         let history = blake3::hash(&serde_json::to_vec(&actions)?).to_hex().to_string();
         let offer = TaskAcceptanceOffer {
@@ -755,6 +756,16 @@ pub async fn offer_task_acceptance(
     }.await;
     journal.close().await;
     result
+}
+
+/// A successful admitted workspace edit that a review offer may bind: the
+/// historical v1 whole-file write or the S033 v2 text patch. Matched
+/// explicitly rather than by aliasing one variant to the other.
+fn is_admitted_workspace_edit(call: &ToolCall) -> bool {
+    matches!(
+        call,
+        ToolCall::WriteWorkspaceFiles { .. } | ToolCall::PatchWorkspaceFiles { .. }
+    )
 }
 
 pub async fn task_acceptance_offer_view(
@@ -931,7 +942,7 @@ pub async fn record_task_acceptance_response(
                 .find(|action| action.intent.id == view.offer.change_action_id)
                 .context("offered workspace edit action is missing")?;
             ensure!(
-                matches!(change.intent.call, ToolCall::WriteWorkspaceFiles { .. })
+                is_admitted_workspace_edit(&change.intent.call)
                     && change.result.as_ref().is_some_and(|result| {
                         result.state == ActionState::Succeeded
                             && result.artifact_hash == view.offer.change_artifact_hash
@@ -2278,152 +2289,126 @@ pub fn plan_workspace_text_patch(
     Ok(WorkspaceTextPatchPlan { patch, postimages })
 }
 
-fn validate_workspace_edits(
-    permission: &TaskWritePermission,
-    snapshot: &SourceSnapshot,
-    edits: &[WorkspaceFileEdit],
-) -> Result<()> {
-    ensure!(
-        !edits.is_empty() && edits.len() <= 32,
-        "invalid admitted task patch"
-    );
-    let allowed = permission.allowed_paths.iter().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-    for edit in edits {
-        let path = normalize_proposed_paths(std::slice::from_ref(&edit.path))?
-            .into_iter()
-            .next()
-            .context("patch path missing")?;
-        ensure!(
-            allowed.contains(&path),
-            "patch path is outside the write permission"
-        );
-        ensure!(seen.insert(path.clone()), "duplicate patch path");
-        ensure!(
-            edit.utf8_bytes.len() <= 16_384,
-            "patch file exceeds 16 KiB bound"
-        );
-        let file = snapshot
-            .files
-            .iter()
-            .find(|file| file.path.to_string_lossy().replace('\\', "/") == path)
-            .context("patch may modify only an existing declared file")?;
-        ensure!(
-            file.hash == edit.expected_hash,
-            "patch expected hash does not match snapshot"
-        );
-    }
-    Ok(())
-}
-
-fn write_workspace_edits(
-    root: &Path,
-    plan: &VerificationPlan,
-    baseline: &str,
-    permission: &TaskWritePermission,
-    edits: &[WorkspaceFileEdit],
-) -> Result<SourceSnapshot> {
-    let snapshot = SourceSnapshot::capture(root, plan)?;
-    ensure!(
-        snapshot.id()? == baseline,
-        "declared inputs changed before workspace write"
-    );
-    validate_workspace_edits(permission, &snapshot, edits)?;
-    for edit in edits {
-        let relative = normalize_proposed_paths(std::slice::from_ref(&edit.path))?.remove(0);
-        let path = root.join(relative);
-        let metadata = fs::symlink_metadata(&path)?;
-        ensure!(
-            metadata.file_type().is_file() && !metadata.file_type().is_symlink(),
-            "patch target is not a regular file"
-        );
-        ensure!(
-            path.canonicalize()?.starts_with(root),
-            "patch target escaped workspace"
-        );
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
-        let mut before = Vec::new();
-        (&mut file).take(16_385).read_to_end(&mut before)?;
-        ensure!(
-            before.len() <= 16_384 && blake3::hash(&before).to_hex().as_str() == edit.expected_hash,
-            "patch target changed before write"
-        );
-        ensure!(
-            std::str::from_utf8(&edit.utf8_bytes).is_ok(),
-            "patch contents must be UTF-8"
-        );
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&edit.utf8_bytes)?;
-        file.set_len(u64::try_from(edit.utf8_bytes.len())?)?;
-        file.sync_all()?;
-    }
-    let post = SourceSnapshot::capture(root, plan)?;
-    ensure!(
-        post.id()? != baseline,
-        "patch produced no declared input change"
-    );
-    Ok(post)
-}
-
-/// Request one bounded patch through the existing durable model ledger and apply
-/// it only under an already-current explicit write permission. A started action
-/// is deliberately unknown after interruption and is never automatically replayed.
-pub async fn run_admitted_task_edit(
+/// The S033 v2 admitted edit: open (or resume) the single edit session for
+/// the current explicit grant, run at most five bounded turns through the
+/// durable request ledger, then apply the prepared patch at most once.
+///
+/// Every turn is reserved before dispatch and started before its one POST. A
+/// read commits its observation (or a bounded refusal) before the next turn is
+/// prepared; a patch commits its prepared action before any write. Transport
+/// failures, timeouts and replies outside the protocol commit as failures that
+/// close the session and pause the run: there is no correction turn and no
+/// retry. A closed session is never reopened; continuing needs a fresh task
+/// state. A successful patch changes the admitted snapshot, so re-admission,
+/// verification, review and an explicit decision remain separate later steps.
+///
+/// `model_for` builds the provider for the session this call opens; its
+/// identity must be the session's provider. v1 whole-file edit requests are no
+/// longer generated: legacy records stay readable, and a run holding any of
+/// them cannot open a v2 session.
+pub async fn run_admitted_task_edit<M: ModelProvider>(
     state_dir: &Path,
     workspace_id: &str,
-    model: &mut impl ModelProvider,
+    profile_digest: &str,
+    model_for: impl FnOnce(&AdmittedEditSession) -> Result<M>,
 ) -> Result<ActionRecord> {
     let mut journal = Journal::open(&state_dir.join("journal.sqlite")).await?;
     let result = async {
         let view = current_write_permission_view(&journal.pool).await?;
-        let permission = view.permission.clone().context("explicit write permission is required")?;
-        ensure!(view.unusable_reason.is_none(), "write permission is unusable");
-        let intake: TaskIntake = serde_json::from_slice(&sqlx::query_scalar::<_, Vec<u8>>("SELECT intake_json FROM task_intakes WHERE singleton = 1").fetch_one(&journal.pool).await?)?;
-        let run = journal.ensure_run_with_objective(Path::new(&view.admission.workspace_root), workspace_id, &view.context.objective).await?;
+        view.permission
+            .as_ref()
+            .context("explicit write permission is required")?;
+        let run = journal
+            .ensure_run_with_objective(
+                Path::new(&view.admission.workspace_root),
+                workspace_id,
+                &view.context.objective,
+            )
+            .await?;
         bind_admission_run_for_planning(&journal, &view.admission, &run.id).await?;
-        let action_id = format!("{}/admitted-write/{}", run.id, permission.id);
-        if let Some(action) = journal.action(&action_id).await? {
-            ensure!(action.result.is_some(), "workspace edit completion is unknown; replay blocked");
-            return Ok(action);
+        let session = journal.open_admitted_edit_session(profile_digest).await?;
+        if let Some(action_id) = &session.action_id {
+            // Resume a prepared action once, or return a saved success.
+            return journal.apply_admitted_text_patch(action_id).await;
         }
-        let purpose = format!("admitted_task_edit_v1:{}:{}", permission.context_id, permission.id);
-        let request_context = ModelContext { actions: Vec::new(), input_hash: permission.snapshot_id.clone(), replan_direction: None, observations: Vec::new() };
-        let mut request = if let Some(saved) = journal.pending_model().await? {
-            ensure!(saved.intent.purpose == purpose && saved.intent.provider == model.identity() && saved.intent.context.input_hash == request_context.input_hash && saved.intent.context.actions.is_empty() && saved.intent.context.observations.is_empty() && saved.intent.context.replan_direction.is_none(), "pending model request does not belong to this admitted edit");
-            saved
-        } else {
-            journal.prepare_model(&RequestIntent { version: 2, provider: model.identity().into(), purpose, context: request_context.clone(), grant: Grant { revision: 2, fixture_writes: false, process_authorization_hash: None }, timeout_ms: model.timeout_ms(), serialized_request: model.prepare_request(&request_context)? }).await?
-        };
-        if request.state == "prepared" {
-            journal.start_model(&request.id).await?;
+        ensure!(
+            session.terminal_reason.is_none(),
+            "edit session is closed ({}); continuing needs a fresh task state with a new admission and grant",
+            session.terminal_reason.as_deref().unwrap_or_default()
+        );
+        let mut model = model_for(&session)?;
+        ensure!(
+            model.identity() == session.provider(),
+            "wrong v2 edit provider identity"
+        );
+        for _ in 0..MAX_EDIT_TURNS {
+            let record = journal
+                .prepare_admitted_edit_turn(&session.id, &model)
+                .await?;
+            journal.start_admitted_edit_turn(&record.id).await?;
             let started = Instant::now();
-            let response = tokio::time::timeout(Duration::from_millis(request.intent.timeout_ms), model.respond_prepared(&request_context, request.intent.serialized_request.as_ref())).await;
-            let reply = match response { Ok(Ok(reply)) if serde_json::to_vec(&reply)?.len() <= 60_000 => Ok(reply), Ok(Ok(_)) => Err(anyhow::anyhow!("provider response exceeds bounded storage limit")), Ok(Err(error)) => Err(error), Err(_) => Err(anyhow::anyhow!("model request timed out; completion may be unknown")) };
-            let saved = RequestResult { reply: reply.as_ref().ok().cloned(), error: reply.as_ref().err().map(|e| e.to_string()), elapsed_ms: u64::try_from(started.elapsed().as_millis())?, provider_observation: model.observation(), limitation: "One bounded permitted patch only; no commands, acceptance, or finalization.".into() };
-            journal.finish_model(&request.id, &saved, &model.artifacts()).await?;
-            let Some(reply) = saved.reply else { anyhow::bail!("model patch request failed: {}", saved.error.unwrap_or_else(|| "unknown".into())); };
-            ensure!(matches!(reply.decision, Decision::AdmittedPatch { .. }), "model returned a decision outside the admitted edit protocol");
-            request = journal.pending_model().await?.context("saved patch response missing")?;
+            let response = tokio::time::timeout(
+                Duration::from_millis(record.intent.timeout_ms),
+                model.respond_prepared(
+                    &record.intent.context,
+                    record.intent.serialized_request.as_ref(),
+                ),
+            )
+            .await;
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis())?;
+            let error = match response {
+                Ok(Ok(reply)) => {
+                    let result = RequestResult {
+                        reply: Some(reply),
+                        error: None,
+                        elapsed_ms,
+                        provider_observation: model.observation(),
+                        limitation: "One bounded v2 edit turn; no commands, acceptance or finalization.".into(),
+                    };
+                    match result.reply.as_ref().map(|reply| &reply.decision) {
+                        Some(Decision::AdmittedTextRead(_)) => {
+                            journal
+                                .finish_admitted_text_read(
+                                    &record.id,
+                                    &result,
+                                    &model.artifacts(),
+                                    &model,
+                                )
+                                .await?;
+                            continue;
+                        }
+                        Some(Decision::AdmittedTextPatch { .. }) => {
+                            let action = journal
+                                .finish_admitted_text_patch(&record.id, &result, &model.artifacts())
+                                .await?;
+                            return journal.apply_admitted_text_patch(&action.intent.id).await;
+                        }
+                        _ => "model returned a decision outside the admitted editing v2 protocol"
+                            .to_owned(),
+                    }
+                }
+                Ok(Err(error)) => format!("{error:#}"),
+                Err(_) => {
+                    "model request timed out; its completion is unknown and it is not retried"
+                        .into()
+                }
+            };
+            let result = RequestResult {
+                reply: None,
+                error: Some(error.clone()),
+                elapsed_ms,
+                provider_observation: model.observation(),
+                limitation: "Failed v2 edit turn; transport artifacts and any usage retained."
+                    .into(),
+            };
+            journal
+                .fail_admitted_edit_turn(&record.id, &result, &model.artifacts())
+                .await?;
+            anyhow::bail!("edit turn failed: {error}");
         }
-        ensure!(request.state == "succeeded", "unknown model completion blocks edit replay");
-        let Decision::AdmittedPatch { edits } = &request.result.as_ref().and_then(|r| r.reply.as_ref()).context("saved patch missing")?.decision else { anyhow::bail!("saved response is not an admitted patch"); };
-        let fresh = current_write_permission_view(&journal.pool).await?;
-        ensure!(fresh.permission.as_ref() == Some(&permission) && fresh.unusable_reason.is_none(), "write permission changed before edit intent");
-        let baseline = journal.source_snapshot(&permission.snapshot_id).await?;
-        validate_workspace_edits(&permission, &baseline, edits)?;
-        let intent = ActionIntent { id: action_id.clone(), call: ToolCall::WriteWorkspaceFiles { edits: edits.clone() }, input_hash: permission.snapshot_id.clone(), grant: Grant { revision: 2, fixture_writes: false, process_authorization_hash: None } };
-        let mut tx = journal.pool.begin().await?;
-        let applied = sqlx::query("UPDATE model_requests SET applied = 1, application = ? WHERE id = ? AND state = 'succeeded' AND applied = 0").bind(format!("admitted_task_edit:{action_id}")).bind(&request.id).execute(&mut *tx).await?;
-        ensure!(applied.rows_affected() == 1, "model patch response already applied");
-        sqlx::query("INSERT INTO actions(id, intent_json, state) VALUES (?, ?, 'prepared')").bind(&intent.id).bind(serde_json::to_string(&intent)?).execute(&mut *tx).await?;
-        tx.commit().await?;
-        journal.start(&action_id).await?;
-        let post = write_workspace_edits(Path::new(&view.admission.workspace_root), &intake.verification_plan, &permission.snapshot_id, &permission, edits)?;
-        let artifact = serde_json::to_vec(&serde_json::json!({"permission_id":permission.id,"paths":edits.iter().map(|e| &e.path).collect::<Vec<_>>(),"post_snapshot":post.id()?}))?;
-        let result = ActionResult { state: ActionState::Succeeded, artifact_hash: blake3::hash(&artifact).to_hex().to_string(), input_after_hash: post.id()?, check_passed: None };
-        journal.complete(&action_id, &result, &artifact, &[]).await?;
-        journal.action(&action_id).await?.context("workspace edit result missing")
-    }.await;
+        anyhow::bail!("edit session used every turn without preparing a patch")
+    }
+    .await;
     journal.close().await;
     result
 }

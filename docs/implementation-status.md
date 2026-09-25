@@ -990,6 +990,56 @@ native Rust 1.98.0, run in Claude's cloud workspace rather than on the operator
 machine (recorded in the plan). Orchestration, durable patch preparation and
 application are Chunk 4. The Chunk 3 review (Sonnet, high) is pending.
 
+Correction (2026-09-24): the sentence above was stale when it was committed.
+Commit `d0bd549` already contains the Chunk 3 review's fixes. Its message
+cites the review's R1, and its test counts grew to 22 decoder and 6 mock-HTTP
+tests. No separate review record is retained.
+
+Chunk 4 (2026-09-24, split into 4a–4d) connects the v2 protocol to the
+workspace. Its fresh-task adversarial review is pending.
+
+- **4a:** a read commits only if the exact next request still fits. The
+  excerpt is shortened if necessary. If even a minimal excerpt cannot fit, the
+  read is refused and reads close (migration 0023), keeping a patch turn
+  available.
+- **4b:** a patch reply is resolved against freshly opened admitted
+  preimages. It then commits together with its prepared `PatchWorkspaceFiles`
+  action and the session's closure, before any write.
+- **4c:** application revalidates every binding and reconstructs the patch
+  exactly. It commits the started marker only after a final permission,
+  snapshot and handle check. It writes each target through its validated
+  handle, reads every target back, and records success only when the whole
+  declared snapshot equals the predicted postimage snapshot. On Windows, the
+  archive attribute of the patched files is excluded from that comparison,
+  because the write sets it (review R4-1). A failed check before start
+  cancels the action. The journal's own run-level start guards instead leave
+  it prepared and resumable (review R4-2). A failure after start is unknown,
+  with no retry or rollback. Targets are refused by type before they are
+  opened. On Linux they are opened non-blocking and without a controlling
+  terminal, so a FIFO swapped in during a race cannot hang the process
+  (review R4-3).
+- **4d:** `task-edit` and the terminal now run the v2 loop. v1 whole-file
+  requests are no longer generated. Offer and acceptance accept either edit
+  variant explicitly.
+
+The same work fixed a pre-existing task-view bug. `edit_done` matched
+`WriteWorkspaceFiles` against snake-case JSON and never fired, so a
+successfully edited task was told to request the patch again instead of to
+re-admit.
+
+`tests/edit_patch.rs` covers fault injection at every S033 interruption
+point, and mutation checks confirm that the key guards are pinned.
+
+- The full v2 lifecycle (patch, re-admission, suite, offer, acceptance,
+  finalization) passes in `tests/task_planning.rs` against a scripted
+  provider.
+- The edit workflow alone (find, patch, apply, and a rejected hostile reply)
+  passes in `tests/llama_edit_v2.rs` through the real adapter against the
+  mock worker.
+
+Nothing has been observed against a real llama.cpp yet (Chunk 7). The gates
+are recorded in the plan.
+
 ## Milestone 3 scope check (2026-09-21)
 
 The master plan (`docs/.shuttle-priv/dedicated-harness-plan.md`, moved here

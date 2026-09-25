@@ -14,7 +14,8 @@ use cortex_shuttle::{
     acceptance::{UserChoice, UserResponse},
     adapter::CortexWeaveAdapter,
     controller::{Controller, Fault, flush_outbox},
-    journal::{Grant, Journal, WorkspaceFileEdit},
+    edit_session::{EDIT_PROTOCOL, parse_edit_model_context},
+    journal::{Grant, Journal, WorkspaceFilePatch, WorkspaceTextHunk},
     model::{Decision, ModelContext, ModelProvider, ModelReply},
     process::{Cancellation, ProcessExecutor, ProcessLimits, ProcessSpec, hash_executable},
     verification::{DeclaredInput, InputKind, SourceSnapshot, VerificationCheck, VerificationPlan},
@@ -30,37 +31,70 @@ use sqlx::{
 };
 use tempfile::tempdir;
 
-struct Planner(Arc<AtomicUsize>, Vec<String>);
+const DIGEST: &str = "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4";
+
+/// The third field is the provider identity. A v2 edit session requires the
+/// planning request to name the same worker profile digest.
+struct Planner(Arc<AtomicUsize>, Vec<String>, String);
 
 fn planner(calls: Arc<AtomicUsize>) -> Planner {
-    Planner(calls, vec!["src/main.rs".into()])
+    Planner(
+        calls,
+        vec!["src/main.rs".into()],
+        "test-admitted-planner-v1".into(),
+    )
 }
 
+fn v2_planner(calls: Arc<AtomicUsize>) -> Planner {
+    Planner(
+        calls,
+        vec!["src/main.rs".into()],
+        format!("shuttle-llama-admitted-planning-v1:{DIGEST}"),
+    )
+}
+
+/// A scripted S033 v2 editor: it composes a durable request and answers
+/// every turn with one exact hunk against the admitted `src/main.rs`.
 struct PatchProvider(Arc<AtomicUsize>, String);
+
+impl PatchProvider {
+    fn new(calls: Arc<AtomicUsize>) -> Self {
+        Self(calls, format!("{EDIT_PROTOCOL}:{DIGEST}"))
+    }
+}
 
 #[async_trait]
 impl ModelProvider for PatchProvider {
     fn identity(&self) -> &str {
-        "test-admitted-planner-v1"
+        &self.1
     }
     fn prepare_request(&self, context: &ModelContext) -> Result<Option<serde_json::Value>> {
-        Ok(Some(serde_json::json!({"snapshot":context.input_hash})))
+        Ok(Some(serde_json::json!({
+            "protocol": EDIT_PROTOCOL,
+            "snapshot": context.input_hash,
+            "exchanges": [{"method": "POST", "body": "{\"stream\":false}"}]
+        })))
     }
     async fn respond(&mut self, _: &ModelContext) -> Result<Decision> {
         unreachable!()
     }
     async fn respond_prepared(
         &mut self,
-        _: &ModelContext,
+        context: &ModelContext,
         _: Option<&serde_json::Value>,
     ) -> Result<ModelReply> {
         self.0.fetch_add(1, Ordering::SeqCst);
+        let (turn, _) = parse_edit_model_context(context)?;
+        let file = &turn.session.initial_context.files[0];
         Ok(ModelReply {
-            decision: Decision::AdmittedPatch {
-                edits: vec![WorkspaceFileEdit {
+            decision: Decision::AdmittedTextPatch {
+                files: vec![WorkspaceFilePatch {
                     path: "src/main.rs".into(),
-                    expected_hash: self.1.clone(),
-                    utf8_bytes: b"fn main() { println!(\"edited\"); }\n".to_vec(),
+                    expected_file_hash: file.hash.clone(),
+                    hunks: vec![WorkspaceTextHunk {
+                        old_utf8: "hello".into(),
+                        new_utf8: "edited".into(),
+                    }],
                 }],
             },
             usage: None,
@@ -71,7 +105,7 @@ impl ModelProvider for PatchProvider {
 #[async_trait]
 impl ModelProvider for Planner {
     fn identity(&self) -> &str {
-        "test-admitted-planner-v1"
+        &self.2
     }
     fn prepare_request(&self, context: &ModelContext) -> Result<Option<serde_json::Value>> {
         Ok(Some(
@@ -575,7 +609,11 @@ async fn write_permission_rejects_changed_inputs_unknown_requests_and_escaped_pa
 
     let (_root, _workspace, state, context) = setup().await;
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut escaped = Planner(calls, vec!["../outside.txt".into()]);
+    let mut escaped = Planner(
+        calls,
+        vec!["../outside.txt".into()],
+        "test-admitted-planner-v1".into(),
+    );
     run_admitted_task_planning(&state, "workspace", &context, &mut escaped)
         .await
         .unwrap();
@@ -656,7 +694,7 @@ async fn write_permission_rolls_back_and_readmission_stales_it() {
 async fn permitted_model_patch_is_durable_then_requires_readmission_before_verification() {
     let (_root, workspace_root, state, context) = setup().await;
     let calls = Arc::new(AtomicUsize::new(0));
-    run_admitted_task_planning(&state, "workspace", &context, &mut planner(calls))
+    run_admitted_task_planning(&state, "workspace", &context, &mut v2_planner(calls))
         .await
         .unwrap();
     workspace::grant_task_write_permission(
@@ -668,23 +706,24 @@ async fn permitted_model_patch_is_durable_then_requires_readmission_before_verif
     .await
     .unwrap();
     let calls = Arc::new(AtomicUsize::new(0));
-    let mut patch = PatchProvider(calls.clone(), context.files[0].hash.clone());
-    let action = workspace::run_admitted_task_edit(&state, "workspace", &mut patch)
-        .await
-        .unwrap();
+    let action = workspace::run_admitted_task_edit(&state, "workspace", DIGEST, |_| {
+        Ok(PatchProvider::new(calls.clone()))
+    })
+    .await
+    .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(action.result.is_some());
-    assert!(
-        fs::read_to_string(workspace_root.join("src/main.rs"))
-            .unwrap()
-            .contains("edited")
+    assert_eq!(
+        fs::read_to_string(workspace_root.join("src/main.rs")).unwrap(),
+        "fn main() { println!(\"edited\"); }\n"
     );
-    let mut replay = PatchProvider(calls.clone(), context.files[0].hash.clone());
-    assert!(
-        workspace::run_admitted_task_edit(&state, "workspace", &mut replay)
-            .await
-            .is_err()
-    );
+    // Rerunning returns the saved success: no second inference, no second write.
+    let replay = workspace::run_admitted_task_edit(&state, "workspace", DIGEST, |_| {
+        Ok(PatchProvider::new(calls.clone()))
+    })
+    .await
+    .unwrap();
+    assert_eq!(replay.result, action.result);
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     let successor = workspace::readmit_intake(
         &state,
@@ -712,9 +751,14 @@ async fn review_offer_binds_the_exact_edit_to_fresh_suite_evidence_and_stales() 
         .unwrap();
     drop(service);
     let calls = Arc::new(AtomicUsize::new(0));
-    run_admitted_task_planning(&state, &native_workspace.id, &context, &mut planner(calls))
-        .await
-        .unwrap();
+    run_admitted_task_planning(
+        &state,
+        &native_workspace.id,
+        &context,
+        &mut v2_planner(calls),
+    )
+    .await
+    .unwrap();
     workspace::grant_task_write_permission(
         &state,
         &context.id().unwrap(),
@@ -723,10 +767,15 @@ async fn review_offer_binds_the_exact_edit_to_fresh_suite_evidence_and_stales() 
     )
     .await
     .unwrap();
-    let mut patch = PatchProvider(Arc::new(AtomicUsize::new(0)), context.files[0].hash.clone());
-    let edit = workspace::run_admitted_task_edit(&state, &native_workspace.id, &mut patch)
-        .await
-        .unwrap();
+    let edit = workspace::run_admitted_task_edit(&state, &native_workspace.id, DIGEST, |_| {
+        Ok(PatchProvider::new(Arc::new(AtomicUsize::new(0))))
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        edit.intent.call,
+        cortex_shuttle::journal::ToolCall::PatchWorkspaceFiles { .. }
+    ));
     assert!(
         workspace::offer_task_acceptance(&state, "offer-before-evidence")
             .await

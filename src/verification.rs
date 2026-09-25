@@ -13,10 +13,14 @@ use sqlx::{Row, Sqlite, Transaction};
 use crate::{
     controller::ToolExecutor,
     journal::{ActionIntent, ActionResult, Grant, Journal, MAX_ARTIFACT_BYTES, ToolCall},
-    process::{ProcessExecutor, ProcessSpec, check_absolute_path, hash_executable},
+    process::{
+        ProcessExecutor, ProcessSpec, check_absolute_path, hash_executable, open_without_effect,
+    },
 };
 
-const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+/// Total declared-source bytes a snapshot captures. Patch application checks
+/// its projected postimage snapshot against this same bound before start.
+pub(crate) const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
 pub const LIMITATIONS: &str = "Declared inputs only; no atomic filesystem snapshot or continuous watcher. Transient changes restored between captures, hostile path races, hard links, external services, dynamic libraries and undeclared dependencies are not covered. Exit zero is an observed check outcome, not proof of test completeness or user acceptance.";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -335,10 +339,23 @@ fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
         fs::symlink_metadata(path)?.is_file(),
         "snapshot metadata must be a regular file"
     );
+    read_opened_bounded(path, limit)
+}
+
+/// The part of `read_bounded` after its type check on the path. Every
+/// snapshot capture reads through here, and so every freshness check does
+/// too. A FIFO swapped in after that check must not block the open, and is
+/// refused on the handle before any read. This is the same pattern as the
+/// admitted edit targets (Chunk 4 review R4-3). Separate so a test can stand
+/// in for losing that race.
+fn read_opened_bounded(path: &Path, limit: u64) -> Result<Vec<u8>> {
+    let file = open_without_effect(path, false)?;
+    ensure!(
+        file.metadata()?.is_file(),
+        "snapshot metadata must be a regular file"
+    );
     let mut bytes = Vec::new();
-    fs::File::open(path)?
-        .take(limit + 1)
-        .read_to_end(&mut bytes)?;
+    file.take(limit + 1).read_to_end(&mut bytes)?;
     ensure!(
         bytes.len() as u64 <= limit,
         "snapshot input byte budget exceeded"
@@ -1016,4 +1033,35 @@ pub(crate) async fn complete_receipt(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// A FIFO at a declared path is refused by `read_bounded`'s type check on the
+/// path in the ordinary case. This pins the other layer: if a FIFO is swapped
+/// in after that check, the open still returns at once and the handle check
+/// refuses it, rather than blocking a freshness check until a writer appears.
+#[cfg(all(test, target_os = "linux"))]
+mod fifo_tests {
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, sync::mpsc, time::Duration};
+
+    use super::{read_bounded, read_opened_bounded};
+
+    #[test]
+    fn a_snapshot_read_that_loses_the_race_to_a_fifo_fails_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("index");
+        let name = CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let checked = read_bounded(&path, 16).unwrap_err().to_string();
+        assert!(checked.contains("regular file"), "{checked}");
+        let (sent, received) = mpsc::channel();
+        std::thread::spawn(move || {
+            sent.send(read_opened_bounded(&path, 16).map_err(|error| error.to_string()))
+                .ok();
+        });
+        let error = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a snapshot read must not wait for a FIFO writer")
+            .unwrap_err();
+        assert!(error.contains("regular file"), "{error}");
+    }
 }

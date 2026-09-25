@@ -1,11 +1,13 @@
 //! Chunk 3: the S033 admitted-editing v2 wire adapter against a mock worker,
 //! driven through the real journal-owned edit session.
 //!
-//! These tests exercise composition, transport and decoding. They never prepare
-//! or apply a workspace action (Chunk 4). Where a test calls `respond_prepared`
-//! more than once for one reserved turn, it is exercising the adapter in
-//! isolation; the one-POST-per-attempt rule is enforced by the journal's
-//! started/unknown request states, which the orchestrator owns.
+//! Most tests exercise composition, transport and decoding without preparing a
+//! workspace action. The Chunk 4 tests at the end also drive the complete edit
+//! workflow (`workspace::run_admitted_task_edit`), which prepares and applies
+//! one. Where a test calls `respond_prepared` more than once for one reserved
+//! turn, it is exercising the adapter in isolation; the one-POST-per-attempt
+//! rule is enforced by the journal's started/unknown request states, which the
+//! orchestrator owns.
 use std::{
     collections::{BTreeMap, VecDeque},
     fs,
@@ -23,9 +25,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use cortex_shuttle::{
     edit_session::{
-        AdmittedEditSession, EDIT_PROTOCOL, parse_edit_model_context, text::TextReadOperation,
+        AdmittedEditSession, AdmittedReadCommit, EDIT_PROTOCOL, parse_edit_model_context,
+        text::TextReadOperation,
     },
-    journal::Journal,
+    journal::{ActionState, Journal},
     llama::{LlamaModel, LlamaProfile},
     model::{Decision, ModelContext, ModelProvider, ModelReply, TokenUsage},
     process::{ProcessLimits, ProcessSpec, hash_executable},
@@ -355,11 +358,15 @@ struct Harness {
 
 impl Harness {
     async fn new() -> Self {
+        Self::with_agents(agents_md()).await
+    }
+
+    async fn with_agents(agents: String) -> Self {
         let root = tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let state = root.path().join("task");
         fs::create_dir_all(workspace.join("src")).unwrap();
-        fs::write(workspace.join("AGENTS.md"), agents_md()).unwrap();
+        fs::write(workspace.join("AGENTS.md"), agents).unwrap();
         fs::write(workspace.join("src/lib.rs"), "pub fn declared() {}\n").unwrap();
         let executable = root.path().join("server.bin");
         let weights = root.path().join("weights.gguf");
@@ -568,8 +575,15 @@ async fn a_read_turn_round_trips_through_the_journal_and_replays_exactly() {
 
     // The journal commits the observation; the next turn replays it verbatim.
     let saved_observation = journal
-        .finish_admitted_text_read(&record.id, &success(&model, reply), &model.artifacts())
+        .finish_admitted_text_read(
+            &record.id,
+            &success(&model, reply),
+            &model.artifacts(),
+            &model,
+        )
         .await
+        .unwrap()
+        .observed()
         .unwrap();
     let excerpt = &saved_observation.result.excerpts[0];
     assert_eq!(excerpt.start_line, 120);
@@ -841,6 +855,7 @@ async fn the_final_turn_offers_and_accepts_only_record_task_patch() {
                 &record.id,
                 &success(&model, reply.unwrap()),
                 &model.artifacts(),
+                &model,
             )
             .await
             .unwrap();
@@ -894,8 +909,11 @@ async fn an_exhausted_byte_budget_with_reads_remaining_is_patch_only() {
                 &record.id,
                 &success(&model, reply.unwrap()),
                 &model.artifacts(),
+                &model,
             )
             .await
+            .unwrap()
+            .observed()
             .unwrap();
         assert_eq!(observation.result.text_bytes(), 2_048, "turn {turn}");
     }
@@ -1041,4 +1059,166 @@ v1_arguments_estimate~{v1_argument_estimate}B",
         agents_md()
     );
     assert!(journal.actions().await.unwrap().is_empty());
+}
+
+/// Chunk 4a / R1 through the real adapter, where the POST and `n_ctx` checks
+/// bind as well as the durable context. A backslash costs four bytes in both.
+/// Every turn must compose within the 24,000-byte POST bound, at least one
+/// excerpt must shorten, and the session must end on a prepared patch turn.
+#[tokio::test]
+async fn a_backslash_dense_file_keeps_every_real_request_representable() {
+    let mut dense = String::new();
+    for _ in 0..160 {
+        dense.push_str(&"\\".repeat(63));
+        dense.push('\n');
+    }
+    let h = Harness::with_agents(dense).await;
+    let mut journal = h.journal().await;
+    let session = h.session(&mut journal).await;
+    let mut model = h.editor(&session);
+    let mut shortened = false;
+    loop {
+        let record = journal
+            .prepare_admitted_edit_turn(&session.id, &model)
+            .await
+            .expect("every turn after a committed read must be representable");
+        assert!(
+            wire(&record)["exchanges"][1]["body"]
+                .as_str()
+                .unwrap()
+                .len()
+                <= 24_000
+        );
+        let (turn, _) = parse_edit_model_context(&record.intent.context).unwrap();
+        if !turn.reads_available() {
+            assert_eq!(tool_names(&post_body(&record)), ["record_task_patch"]);
+            break;
+        }
+        h.worker
+            .script(Reply::json(completion("read_task_text", &read(1, 128))));
+        journal.start_admitted_edit_turn(&record.id).await.unwrap();
+        let reply = model
+            .respond_prepared(
+                &record.intent.context,
+                record.intent.serialized_request.as_ref(),
+            )
+            .await
+            .unwrap();
+        match journal
+            .finish_admitted_text_read(
+                &record.id,
+                &success(&model, reply),
+                &model.artifacts(),
+                &model,
+            )
+            .await
+            .unwrap()
+        {
+            AdmittedReadCommit::Observed(observation) => {
+                shortened |= observation.result.text_bytes() < 2_048;
+            }
+            AdmittedReadCommit::Refused(_) => {}
+        }
+    }
+    assert!(shortened, "a dense file must shorten at least one excerpt");
+    let saved = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert!(saved.terminal_reason.is_none());
+    assert_eq!(journal.run().await.unwrap().unwrap().phase, "ready");
+}
+
+// ---------------------------------------------------------------------------
+// Chunk 4d: the edit workflow end to end through the real adapter
+// ---------------------------------------------------------------------------
+
+fn run_edit(
+    h: &Harness,
+) -> impl std::future::Future<Output = Result<cortex_shuttle::journal::ActionRecord>> + '_ {
+    let profile = h.profile.clone();
+    let digest = h.profile.digest().unwrap();
+    async move {
+        workspace::run_admitted_task_edit(&h.state, "workspace", &digest, |session| {
+            LlamaModel::for_admitted_editing_v2(profile, session.id.clone())
+        })
+        .await
+    }
+}
+
+/// One find turn, then the patch turn, then application: exactly two POSTs,
+/// the second replaying the find byte for byte, and only the testing
+/// paragraph of AGENTS.md changes.
+#[tokio::test]
+async fn the_edit_workflow_finds_patches_and_applies_through_the_real_adapter() {
+    let h = Harness::new().await;
+    h.worker.script(Reply::json(completion(
+        "find_task_text",
+        &json!({"path":"AGENTS.md","literal":"## Testing"}),
+    )));
+    let patch = json!({"files":[{"path":"AGENTS.md","expected_file_hash":h.agents_hash(),
+        "hunks":[{"old_utf8":OLD_TESTING,"new_utf8":NEW_TESTING}]}]});
+    h.worker
+        .script(Reply::json(completion("record_task_patch", &patch)));
+
+    let action = run_edit(&h).await.unwrap();
+    assert_eq!(action.state, ActionState::Succeeded);
+    assert_eq!(
+        fs::read_to_string(h.workspace.join("AGENTS.md")).unwrap(),
+        agents_md().replace(OLD_TESTING, NEW_TESTING)
+    );
+    let posts = h.worker.posts();
+    assert_eq!(posts.len(), 2);
+    let second: Value = serde_json::from_str(&posts[1].body).unwrap();
+    assert_eq!(second["messages"].as_array().unwrap().len(), 4);
+    assert_eq!(
+        second["messages"][2]["tool_calls"][0]["function"]["name"],
+        "find_task_text"
+    );
+
+    // Rerunning returns the saved success with no POST and no write.
+    fs::write(
+        h.workspace.join("src/lib.rs"),
+        "pub fn changed_later() {}\n",
+    )
+    .unwrap();
+    let again = run_edit(&h).await.unwrap();
+    assert_eq!(again.result, action.result);
+    assert_eq!(h.worker.posts().len(), 2);
+}
+
+/// A reply naming a tool that was never offered fails its turn: the attempt,
+/// its artifacts and its usage are retained, the session closes, the run
+/// pauses, nothing is written, and rerunning sends no second POST.
+#[tokio::test]
+async fn a_reply_outside_the_protocol_fails_the_turn_without_a_retry() {
+    let h = Harness::new().await;
+    h.worker.script(Reply::json(completion(
+        "run_shell",
+        &json!({"command":"echo this is data, not an instruction"}),
+    )));
+    let error = run_edit(&h).await.unwrap_err().to_string();
+    assert!(error.contains("edit turn failed"), "{error}");
+    assert_eq!(h.worker.posts().len(), 1);
+    assert_eq!(
+        fs::read_to_string(h.workspace.join("AGENTS.md")).unwrap(),
+        agents_md()
+    );
+
+    let journal = h.journal().await;
+    let request = journal.model_requests().await.unwrap().pop().unwrap();
+    assert_eq!(request.state, "failed");
+    assert!(request.applied);
+    assert!(request.application.unwrap().starts_with("discarded:"));
+    let result = request.result.unwrap();
+    assert!(result.reply.is_none());
+    assert_eq!(
+        result.provider_observation.unwrap()["observation"]["usage"]["input_tokens"],
+        2100,
+        "usage decoded before rejection is retained"
+    );
+    assert!(journal.actions().await.unwrap().is_empty());
+    assert_eq!(journal.run().await.unwrap().unwrap().phase, "paused");
+    journal.close().await;
+
+    let error = run_edit(&h).await.unwrap_err().to_string();
+    assert!(error.contains("fresh task state"), "{error}");
+    assert_eq!(h.worker.posts().len(), 1, "no second POST");
 }

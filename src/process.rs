@@ -507,6 +507,24 @@ pub(crate) fn check_absolute_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Open a path without any effect of its own. It never truncates or creates.
+/// Callers check the path's type first and check it again on the returned
+/// handle. On Linux, if a FIFO or terminal is swapped in between the two
+/// checks, the open still returns at once and never takes a controlling
+/// terminal, so the handle check can refuse it. Both flags are inert for a
+/// regular file, including for later writes through the handle. Shared by
+/// admitted edit targets (review R4-3) and snapshot reads.
+pub(crate) fn open_without_effect(path: &Path, writable: bool) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(writable);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    }
+    options.open(path)
+}
+
 /// Exact observed repetition; excludes IDs, PIDs, elapsed time and delivery metadata.
 /// Truncated output cannot prove repetition, because unseen bytes may be new evidence.
 pub(crate) fn progress_fingerprint(

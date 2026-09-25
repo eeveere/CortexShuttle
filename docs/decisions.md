@@ -912,6 +912,130 @@ while implementing the adapter. They are refinements, not relaxations.
    remaining budgets and replayed read pairs. Identity metadata (run, admission,
    permission and profile IDs) is not sent to the model.
 
+Clarification (2026-09-24, Chunk 4a: size-aware read commit, Chunk 3 review
+R1). A session could spend reads whose replayed history made the next request
+unrepresentable. Escaping multiplies text in the durable context: a backslash
+costs four bytes and a control character seven. The next preparation then
+failed and closed the session, with reads remaining and no patch possible.
+That contradicts the fifth turn's purpose of reserving a final patch. The
+following rules close the gap. Bounds revision 1 is unchanged.
+
+1. **Measure the next turn exactly.** Before a read commits, the journal
+   composes the complete next-turn request with the candidate observation
+   appended. It uses the same function and provider (identity checked) that
+   will prepare that turn. That turn must pass every preparation bound: the
+   24,000-byte durable context, the adapter's 24,000-byte POST and `n_ctx`
+   checks, and the 65,536-byte request intent.
+2. **Shorten rather than overflow.** If the full allowance does not fit, the
+   read commits at the largest allowance whose next turn was composed and
+   passed. A deterministic search finds it. The excerpt is shortened by the
+   ordinary allowance rules (scalar and CRLF boundaries) and marked truncated.
+   This is the existing "a smaller remaining excerpt allowance may shorten a
+   read" sentence, now bounded by the next request's size as well as by the
+   remaining budget. Domain failures such as range or UTF-8 errors are still
+   decided at the full allowance and still discard the turn.
+3. **Decision (b): charge actual bytes.** A shortened observation consumes
+   exactly the bytes it returned. The unreturned remainder stays in the
+   cumulative budget.
+4. **Decision (a): refuse, and keep the patch turn.** If no allowance of at
+   least one byte fits, the read is refused instead of closing the session. In
+   one transaction:
+   - the request is committed `succeeded` and applied, with its reply and
+     artifacts retained and application `refused_read:<reason>`;
+   - no observation is stored and the read counters are unchanged;
+   - the session's `reads_closed_reason` is set. Migration 0023 adds it; it is
+     set once and never cleared.
+
+   The session stays open and the run stays ready. Every later turn carries
+   `reads_closed`: the adapter offers only `record_task_patch`, and the journal
+   rejects any read on that turn, closing the session as it would for any
+   invalid reply. This is a deliberate, narrow exception to the 2026-09-18
+   closure rule. The refused read did not fail preparation. It is a bounded
+   decline of an otherwise valid reply, and it preserves the reserved patch
+   turn. The refusal commits only if the patch-only continuation itself
+   composes. Otherwise the turn fails closed and the session closes.
+5. **Why the continuation always fits.** `reads_closed` is always serialized
+   in the turn context. Changing `false` to `true` shortens it by one byte.
+   The patch-only tool set and `patch_only` flag only shrink the request, and
+   turn counters stay single digits. So the turn after a refusal (same history,
+   one turn later) is never larger than the refused turn, which fit. Omitting
+   the field while false was tried first: a refusal after an exactly shortened
+   read then overflowed by the bytes of the added field.
+
+Together, every committed read leaves a representable next turn and every
+refused read leaves a representable patch-only turn. So no sequence of
+permitted reads can leave a session without a patch turn, given that turn 0
+was representable, which preparation checks before any read. No saved
+observation is dropped or rewritten, and no limit is raised. Adding the field
+changes the canonical turn-context bytes. No v2 session exists outside tests,
+and a prepared v2 request saved by an earlier build would fail the exact
+recomposition check and close its session, which fails closed.
+
+Clarification (2026-09-24, Chunks 4b–4d: preparation, application and
+orchestration). These settle choices the rules above left open. They add no
+capability and relax nothing, except the one attribute bit in item 4 (see
+there).
+
+1. **Identities.** The prepared action ID is
+   `<run_id>/admitted-text-patch/<session_id>`. The originating request's
+   application is `admitted_text_patch:<action_id>`. The session's `action_id`
+   and its closure commit in the same transaction as the action. Application
+   checks all three bindings before any write.
+2. **Before the started marker, application's own checks cancel.** A
+   drifted input, revoked grant, new hard link, failed reconstruction or any
+   other failed check that application makes before the started marker
+   records the action `cancelled`. The result artifact records the reason.
+   Its `input_after_hash` is the literal text "unobserved", because no
+   capture is claimed. The run pauses. A cancelled action is never resumed.
+   The run-level guards inside the journal's `start` are the exception: the
+   acceptance seal, execution budget or stall, a pending model request, or a
+   run that is not ready. Failing one of them returns with the action still
+   `prepared` and the run unchanged. Nothing was written, and application
+   can resume once the condition clears, for example after an explicit stall
+   resumption. (Wording corrected 2026-09-24, Chunk 4 review R4-2. The first
+   text said every failure cancels, which the code never did.)
+3. **After the started marker, failures are unknown immediately.** An I/O
+   error, a target that changed before its write, a failed read-back, a post
+   snapshot mismatch or a failed success commit marks the action `unknown` and
+   pauses the run at once, in the same process. A crash leaves `started`, which
+   restart recovery converts to `unknown`. Neither case retries or rolls back.
+4. **Success means an exact snapshot match.** The post snapshot must *equal*
+   the predicted one: the admitted snapshot with only the patched files' sizes
+   and hashes replaced and the Git declared-working-tree identity recomputed.
+   Every other file and all metadata must be unchanged. The full post snapshot
+   is stored under its identity. The completion artifact binds that identity,
+   the patch identity and each observed post hash.
+   One narrow exception, added 2026-09-24 after Chunk 4 review R4-1. On
+   Windows, a snapshot file's `permissions` is its full attribute mask, and
+   NTFS sets `FILE_ATTRIBUTE_ARCHIVE` (0x20) when a file is written in place.
+   A target admitted with that bit clear therefore failed the comparison
+   after a byte-perfect write and ended `unknown`. That is fail-safe, but it
+   burned the task state. The comparison now excludes that bit, only on the
+   patched files, and recomputes the declared-working-tree identity for both
+   sides from that view. It also excludes `FILE_ATTRIBUTE_NORMAL` (0x80) on
+   those files. Windows reports NORMAL only when no other attribute is set,
+   so it flips whenever the archive bit does and carries no information of
+   its own. Excluding it, rather than predicting it set,
+   also covers file systems that do not set it. Every other attribute of a
+   patched file, every attribute of an unpatched file, and all other
+   metadata stay exact. The stored post snapshot is the observed one, with
+   the bit as the file system left it. This is the only relaxation in these
+   clarifications. It matches S033's reason for writing in place: preserving
+   the metadata that is the file's own, not metadata the write itself sets.
+5. **One failure path for undecodable turns.** Transport or decoder errors, a
+   timeout, and a decision that is neither a read nor a patch all commit
+   through the same bounded failure as a domain rejection: `failed`, applied,
+   `discarded:<reason>`, session closed and run paused. Transport artifacts
+   are kept, as is any usage decoded before rejection, nested in
+   `provider_observation`.
+6. **v1 generation has stopped.** The v1 orchestrator and whole-file executor
+   are removed. `task-edit` and the terminal's edit operation run v2 only.
+   `WriteWorkspaceFiles` records remain readable. Offer creation and
+   acceptance match `WriteWorkspaceFiles` or `PatchWorkspaceFiles` explicitly
+   rather than aliasing one to the other, so an old journal already under
+   review can still finish. The v1 adapter constructor is kept only so tests
+   can prove that a v1 request never reaches the v2 decoder.
+
 ### Protocol examples
 
 In this table `\n`/`\r\n` denote decoded newlines, and every file supplies the

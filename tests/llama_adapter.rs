@@ -53,6 +53,17 @@ impl Response {
         }
     }
 }
+/// How long the mock waits for a complete request after accepting a
+/// connection. It was 2 s, and on a Windows host under memory pressure (a
+/// busy Docker VM, parallel builds) the client process can stall for longer
+/// than that between connecting and sending. The mock then gave up and closed
+/// the socket unanswered and unrecorded, and hyper reported "connection closed
+/// before message completed". Failing runs showed stalls of about 10 s, so
+/// this allows 30 s. It is still bounded, so a connection that never sends
+/// cannot hang teardown. This is a harness fix only: the production client
+/// keeps its one-attempt, no-retry transport.
+const MOCK_REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(30);
+
 struct Server {
     url: String,
     calls: Arc<Mutex<Vec<Request>>>,
@@ -76,9 +87,16 @@ impl Server {
                 };
                 socket.set_nonblocking(false).unwrap();
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .set_read_timeout(Some(MOCK_REQUEST_READ_TIMEOUT))
                     .unwrap();
+                let accepted = std::time::Instant::now();
                 let Some(request) = read_request(&mut socket) else {
+                    // Never drop a connection silently: this line is captured
+                    // with the failing test's output.
+                    eprintln!(
+                        "mock server: no complete request {:?} after accept; closing the connection unanswered",
+                        accepted.elapsed()
+                    );
                     continue;
                 };
                 seen.lock().unwrap().push(request.clone());
@@ -792,4 +810,27 @@ async fn invalid_profiles_and_oversized_contexts_never_dispatch() {
     assert!(model.prepare_request(&context).is_err());
     assert!(model.respond(&context).await.is_err());
     assert!(server.calls.lock().unwrap().is_empty());
+}
+
+/// Harness regression: a client that stalls for longer than the old 2 s
+/// request wait (as a paged-out test process did on a loaded Windows host)
+/// still gets its response, and the request is recorded rather than
+/// silently dropped.
+#[test]
+fn the_mock_server_waits_for_a_slow_client_instead_of_dropping_it() {
+    let server = Server::new(|_| Response::json(json!({"ok": true})));
+    let mut client = TcpStream::connect(server.url.trim_start_matches("http://")).unwrap();
+    std::thread::sleep(Duration::from_millis(3_000));
+    client
+        .write_all(b"GET /props HTTP/1.1\r\nhost: mock\r\n\r\n")
+        .unwrap();
+    let mut reply = Vec::new();
+    client.read_to_end(&mut reply).unwrap();
+    assert!(
+        reply.starts_with(b"HTTP/1.1 200 "),
+        "{:?}",
+        String::from_utf8_lossy(&reply)
+    );
+    assert!(reply.ends_with(br#"{"ok":true}"#));
+    assert_eq!(server.calls.lock().unwrap().len(), 1);
 }
