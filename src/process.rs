@@ -323,18 +323,23 @@ impl ToolExecutor for ProcessExecutor {
             spawn_error: None,
             tree_stopped: true,
         };
-        // The remaining checks depend only on the specification and this host. Failing
-        // one means no launch was attempted, so it is a recorded failure, not an
-        // unknown effect.
-        if let Err(error) = validate_process_spec(&self.root, spec) {
-            report.reason = StopReason::SpawnFailed;
-            report.spawn_error = Some(
-                format!("refused before launch: {error:#}")
-                    .chars()
-                    .take(512)
-                    .collect(),
-            );
-            return self.observation(report);
+        // A missing executable or working directory means no launch was attempted, so
+        // it is a recorded failure, not an unknown effect. Any other refusal (a
+        // changed executable, a link or escape in the working directory, an invalid
+        // specification) may be tampering and stays an error like the checks above.
+        match check_launch(spec, Some(&self.root)) {
+            Ok(()) => {}
+            Err(LaunchFault::Absent(error)) => {
+                report.reason = StopReason::SpawnFailed;
+                report.spawn_error = Some(
+                    format!("refused before launch: {error:#}")
+                        .chars()
+                        .take(512)
+                        .collect(),
+                );
+                return self.observation(report);
+            }
+            Err(LaunchFault::Refused(error)) => return Err(error),
         }
         if self.cancellation.is_cancelled() {
             return self.observation(report);
@@ -420,62 +425,136 @@ impl ToolExecutor for ProcessExecutor {
     }
 }
 
+/// Why a launch check failed. `Absent` is a plain host fact: the executable or the
+/// working directory is not there. Everything else is `Refused`: a changed
+/// executable, a link or escape in the working directory, or an invalid
+/// specification. Only `Absent` may be recorded as a failure after the started
+/// marker; a refusal there is a possible tampering signal and stays an error.
+enum LaunchFault {
+    Absent(anyhow::Error),
+    Refused(anyhow::Error),
+}
+
+impl LaunchFault {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            Self::Absent(error) | Self::Refused(error) => error,
+        }
+    }
+
+    fn classify(error: anyhow::Error) -> Self {
+        let absent = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        });
+        if absent {
+            Self::Absent(error)
+        } else {
+            Self::Refused(error)
+        }
+    }
+}
+
+fn check_executable(spec: &ProcessSpec) -> Result<(), LaunchFault> {
+    check_absolute_path(&spec.executable).map_err(LaunchFault::classify)?;
+    if !spec.executable.is_file() {
+        return Err(LaunchFault::Refused(anyhow::anyhow!(
+            "executable must be a regular file"
+        )));
+    }
+    #[cfg(windows)]
+    if !spec
+        .executable
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    {
+        return Err(LaunchFault::Refused(anyhow::anyhow!(
+            "use an explicit native .exe; batch files require an explicitly granted shell"
+        )));
+    }
+    match hash_executable(&spec.executable) {
+        Ok(hash) if hash == spec.executable_hash => Ok(()),
+        Ok(_) => Err(LaunchFault::Refused(anyhow::anyhow!(
+            "executable identity changed"
+        ))),
+        Err(error) => Err(LaunchFault::classify(error)),
+    }
+}
+
+fn check_working_directory(root: &Path, spec: &ProcessSpec) -> Result<(), LaunchFault> {
+    match resolve_under(root, &spec.cwd) {
+        Ok(path) if path.is_dir() => Ok(()),
+        Ok(_) => Err(LaunchFault::Refused(anyhow::anyhow!(
+            "working directory must be a directory"
+        ))),
+        // Only a missing path is a plain absence. Any other failure (an escape, a
+        // link or reparse point, a malformed path) keeps its own message.
+        Err(error) => Err(match LaunchFault::classify(error) {
+            LaunchFault::Absent(error) => {
+                LaunchFault::Absent(error.context("working directory must exist"))
+            }
+            refused => refused,
+        }),
+    }
+}
+
+/// Every launch check, in one place. Without a root the working directory is not
+/// checked: it may legitimately be created by an earlier check of the same plan.
+fn check_launch(spec: &ProcessSpec, root: Option<&Path>) -> Result<(), LaunchFault> {
+    let shape = || -> Result<()> {
+        ensure!(
+            cfg!(any(windows, target_os = "linux")),
+            "process execution requires Windows 10+ or Linux"
+        );
+        spec.limits.reservation_ms()?;
+        ensure!(
+            spec.arguments.len() <= 256 && spec.environment.len() <= 128,
+            "too many arguments/environment entries"
+        );
+        ensure!(
+            serde_json::to_vec(spec)?.len() <= 32_768,
+            "process specification exceeds limit"
+        );
+        ensure!(
+            spec.arguments.iter().all(|s| !s.contains('\0')),
+            "argument contains NUL"
+        );
+        let mut names = std::collections::BTreeSet::new();
+        for (name, value) in &spec.environment {
+            ensure!(
+                !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
+                "invalid environment entry"
+            );
+            ensure!(
+                names.insert(name.to_uppercase()),
+                "case-insensitive environment name collision"
+            );
+        }
+        Ok(())
+    };
+    shape().map_err(LaunchFault::Refused)?;
+    check_executable(spec)?;
+    match root {
+        Some(root) => check_working_directory(root, spec),
+        None => Ok(()),
+    }
+}
+
 /// The launch checks that depend only on the specification, the canonical
 /// workspace root and this host, not on a grant or on declared-input state.
-/// Task preflight runs them so a plan that could never launch is refused before
-/// any model turn is spent; `validate` repeats them before every launch.
+/// `validate` runs them before every dispatch and the executor repeats them
+/// after the started marker.
 pub fn validate_process_spec(root: &Path, spec: &ProcessSpec) -> Result<()> {
-    ensure!(
-        cfg!(any(windows, target_os = "linux")),
-        "process execution requires Windows 10+ or Linux"
-    );
-    spec.limits.reservation_ms()?;
-    check_absolute_path(&spec.executable)?;
-    ensure!(
-        spec.executable.is_file(),
-        "executable must be a regular file"
-    );
-    #[cfg(windows)]
-    ensure!(
-        spec.executable
-            .extension()
-            .is_some_and(|e| e.eq_ignore_ascii_case("exe")),
-        "use an explicit native .exe; batch files require an explicitly granted shell"
-    );
-    ensure!(
-        hash_executable(&spec.executable)? == spec.executable_hash,
-        "executable identity changed"
-    );
-    ensure!(
-        resolve_under(root, &spec.cwd)
-            .context("working directory must exist")?
-            .is_dir(),
-        "working directory must exist"
-    );
-    ensure!(
-        spec.arguments.len() <= 256 && spec.environment.len() <= 128,
-        "too many arguments/environment entries"
-    );
-    ensure!(
-        serde_json::to_vec(spec)?.len() <= 32_768,
-        "process specification exceeds limit"
-    );
-    ensure!(
-        spec.arguments.iter().all(|s| !s.contains('\0')),
-        "argument contains NUL"
-    );
-    let mut names = std::collections::BTreeSet::new();
-    for (name, value) in &spec.environment {
-        ensure!(
-            !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
-            "invalid environment entry"
-        );
-        ensure!(
-            names.insert(name.to_uppercase()),
-            "case-insensitive environment name collision"
-        );
-    }
-    Ok(())
+    check_launch(spec, Some(root)).map_err(LaunchFault::into_error)
+}
+
+/// The same checks without the working directory. Task preflight runs this on the
+/// first admission so a plan that could never launch is refused before any model
+/// turn is spent. It cannot know whether an earlier check will create a directory
+/// a later check runs in, so that fact is left to each check's own preparation.
+pub fn validate_process_spec_static(spec: &ProcessSpec) -> Result<()> {
+    check_launch(spec, None).map_err(LaunchFault::into_error)
 }
 
 fn resolve_under(root: &Path, relative: &Path) -> Result<PathBuf> {

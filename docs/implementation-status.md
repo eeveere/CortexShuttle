@@ -1160,42 +1160,80 @@ This qualifies the protocol, not task success. Still open:
 
 Closing S033 does not close Milestone 3 (see the scope check below).
 
-Executor follow-ups from Chunk 7 (K3, 2026-09-25; the operator's review and
-acceptance are pending, and the focused K3 review has not run):
-- **K3a.** Task preflight now runs the static launch checks on every unwaived
-  check (`validate_process_spec`, shared with the executor), so a plan that
-  could never launch, such as one naming `npm.cmd`, is refused before
-  admission and before any model turn.
-- **K3a.** `task-verify-status` reports `not_prepared` for a check whose
-  preparation was refused; `unknown` is kept for a prepared or started action.
+Executor follow-ups from Chunk 7 (K3, 2026-09-25). The operator has not yet
+accepted the review-fix commit. The first K3 commit (`8655250`) received an
+independent Opus : high review; its findings and their disposition follow the
+list.
+- **K3a.** Task preflight runs the launch checks that need neither a grant nor
+  the working directory (`validate_process_spec_static`: platform, limits,
+  absolute executable path, the Windows `.exe` rule, executable hash, argument
+  and environment bounds) on every unwaived check. A plan that names `npm.cmd`
+  is refused before admission and before any model turn. This is the first
+  admission only: re-admission of an existing task does not repeat it, and a
+  plan whose executable later changes is refused when a check is prepared. It is
+  not a proof that a plan can launch: a `.exe` that is not a valid executable
+  passes it.
+- **K3a.** The working directory is deliberately not checked at preflight. An
+  earlier check may create it (`cmake -B build`, then a check that runs in
+  `build`), and each check still requires it when that check is prepared.
+- **K3a.** `task-verify-status` reports `not_prepared` for a check bound to the
+  admission whose preparation was refused, and `not_started` for a prepared
+  action that never started. `unknown` is reserved for a started or unknown
+  action with no receipt. (Before the review fix a prepared action was
+  reported as `unknown`.)
 - **K3b.** On Windows the child's working directory is passed without the
   `\\?\` prefix when the plain form names the same directory; identities are
   unchanged.
 - **K3c.** The launch-boundary repeat of the checks, after the durable started
-  marker, is split. A grant, authorization or declared-input mismatch is still
-  an error: the run pauses with the action started, and reopening makes it
-  unknown. A failure of the spec-and-host checks (`validate_process_spec`,
-  such as a changed executable or a missing working directory) means no launch
-  was attempted. It is now recorded as a `Failed` observation with
-  `SpawnFailed` and a bounded `refused before launch: …` reason, so it is a
-  receipt and no longer an unknown effect. This deliberately covers less than
-  the plan's "any pre-spawn re-validation failure": grant or input drift is an
-  integrity signal and keeps its pause. Two tests in
-  `tests/process_execution.rs` pin it: a direct executor test (including that
-  input drift still errors), and a controller test whose wrapper executor
-  passes the pre-start check and then races the launch boundary. Both fail
-  with the change reverted.
+  marker, distinguishes an absence from every other refusal. A missing
+  executable or a missing working directory means no launch was attempted; it
+  is recorded as a `Failed` observation with `SpawnFailed` and a bounded
+  `refused before launch: …` reason, not an unknown effect. Every other
+  refusal stays an error, so the run pauses with the action started and
+  reopening makes it unknown: a grant, authorization or declared-input
+  mismatch, a changed executable hash, a symlink, reparse point or escape in
+  the working directory, an exists-but-not-a-directory working directory, and
+  an invalid specification. Those may be tampering, not absence.
+- **K3c, scope for admitted checks.** A verification check's snapshot covers
+  its executable identity, and `dispatch_inner` revalidates that snapshot
+  after the started marker and before execution. So for an admitted check a
+  changed or missing executable fails there and still leaves the action
+  unknown. Only a working directory, which the snapshot does not cover,
+  reaches the recorded-failure path. This deliberately covers less than the
+  original plan's "any pre-spawn re-validation failure".
+- **K3c tests** (`tests/process_execution.rs`). Absence is recorded (direct and
+  through the controller, with the reserved active time refunded and the
+  failure kept across reopen and replay); a changed executable, a working
+  directory swapped for a link, and input drift stay errors, and the changed
+  executable leaves the action unknown on reopen. Mutating the
+  absence-versus-refusal classification either way fails them. A unit test in
+  `src/main.rs` pins every status label, and `tests/task_intake.rs` covers the
+  preflight scope.
+- **Review of `8655250` (Opus : high, fresh session, read-only).** No defect in
+  the started/unknown/replay-block guarantees, no raised limit and no weakened
+  freshness gate. Findings and outcome: (1) docs overclaimed a changed
+  executable being recorded as a failure for admitted checks: fixed by the
+  scope paragraph above. (2) preflight refused plans whose working directory a
+  prior check creates: fixed, the directory is no longer checked. (3) demoting
+  a changed executable or a link in the working directory contradicted the
+  integrity rationale: fixed by narrowing K3c to absences (option A). (4) every
+  working-directory error was labelled "must exist": fixed, the label applies
+  only to a missing path. (5) `unknown` for a prepared action: fixed
+  (`not_started`). (6) re-admission does not repeat the preflight gate:
+  documented, not changed. Not applied: checking cancellation before the
+  launch checks, and re-running the launch checks at re-admission.
 - **K3d.** No change was needed. The Windows environment baseline (`SystemRoot`,
   `ComSpec`, `PATH`, `TEMP`/`TMP` outside the workspace, `node.exe` with
   `npm-cli.js`) was already in the manual qualification guide.
-- Gates on the final tree: Windows 269 passed, 0 failed, 10 ignored; Docker
-  Linux (pinned Rust 1.98 / Python 3.14.7 image) 270 passed, 0 failed, 10
-  ignored; formatting and warnings-denied Clippy pass on both. The first
-  Windows test run failed to build because of corrupted `tokio`, `tokio-util`,
-  `icu_provider`, `zerotrie` and `cortex-shuttle` artifacts in `target`, not a
-  code defect. Only those packages were cleaned, and the rebuilt tree passed.
-  Logs are in ignored `.shuttle/k3c-windows-test.log` and
-  `.shuttle/k3c-docker-linux.log`.
+- Gates on the final tree, after the review fixes: Windows 272 passed, 0 failed,
+  10 ignored; Docker Linux (pinned Rust 1.98 / Python 3.14.7 image) 273 passed,
+  0 failed, 10 ignored; formatting and warnings-denied Clippy pass on both.
+  Clippy first rejected the new `src/main.rs` unit-test module for sitting before
+  other items; it now sits at the end of the file. An earlier Windows test run of
+  the first K3 commit failed to build because of corrupted `tokio`, `tokio-util`,
+  `icu_provider`, `zerotrie` and `cortex-shuttle` artifacts in `target`, not a code
+  defect; only those packages were cleaned. Logs are in ignored
+  `.shuttle/k3fix2-windows.log` and `.shuttle/k3fix2-docker.log`.
 - Still open from Chunk 7: K4 (the known-broken plan file), the edit-context
   increment (S034) and step 9's manual terminal records. The optional
   workspace-pollution evidence stays deferred.

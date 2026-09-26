@@ -111,10 +111,11 @@ before each check. A changed input blocks later checks, an unknown action blocks
 replay, and each completed receipt keeps its own stale state. A failed check may
 resume the declared suite only after its result is durable and native delivery is
 complete. `task-verify-status`
-reports waived, pending, not_prepared, passed, failed, stale and unknown checks.
-`not_prepared` means the check was bound to the admission but its preparation
-was refused, so no action exists and nothing started; `unknown` is kept for a
-prepared or started action with no receipt. It opens the
+reports waived, pending, not_prepared, not_started, passed, failed, stale and
+unknown checks. `not_prepared` means the check was bound to the admission but its
+preparation was refused, so no action exists and nothing started. `not_started`
+means the action was prepared but never started. `unknown` is only a started or
+unknown action with no receipt. It opens the
 journal, so it may recover interrupted work and persist staleness. It does not
 dispatch work.
 

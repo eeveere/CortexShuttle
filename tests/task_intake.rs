@@ -275,8 +275,8 @@ async fn preflight_binds_a_fresh_snapshot_without_admitting_a_run() {
     assert!(run_demo(&state_dir, Some(&intake.id)).await.is_err());
 }
 
-/// Preflight refuses a check that could never launch, so no model turn is spent
-/// on a plan whose verification is certain to be refused later.
+/// Preflight refuses a check whose specification can never launch, so no model
+/// turn is spent on a plan whose verification is certain to be refused later.
 #[tokio::test]
 async fn preflight_refuses_a_check_that_can_never_launch() {
     let root = tempdir().unwrap();
@@ -285,8 +285,6 @@ async fn preflight_refuses_a_check_that_can_never_launch() {
     fs::create_dir(workspace.join("src")).unwrap();
     fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    let mut missing_cwd = plan();
-    missing_cwd.checks[0].process.cwd = "build".into();
     let mut wrong_hash = plan();
     wrong_hash.checks[0].process.executable_hash = "0".repeat(64);
     #[cfg(windows)]
@@ -300,12 +298,9 @@ async fn preflight_refuses_a_check_that_can_never_launch() {
     };
     #[cfg(not(windows))]
     let batch = None;
-    let cases = [
-        ("missing-cwd", missing_cwd, "working directory must exist"),
-        ("wrong-hash", wrong_hash, "executable identity changed"),
-    ]
-    .into_iter()
-    .chain(batch);
+    let cases = [("wrong-hash", wrong_hash, "executable identity changed")]
+        .into_iter()
+        .chain(batch);
     for (name, plan, message) in cases {
         let state_dir = root.path().join(name);
         let intake = create_intake(&state_dir, &workspace, "observe".into(), Vec::new(), plan)
@@ -320,6 +315,26 @@ async fn preflight_refuses_a_check_that_can_never_launch() {
         reader.close().await;
         assert!(admit_intake(&state_dir, Some(&intake.id)).await.is_err());
     }
+
+    // A working directory that does not exist yet does not block preflight or
+    // admission: an earlier check of the same plan may create it, and each check
+    // still requires it when that check is prepared.
+    let mut later_cwd = plan();
+    later_cwd.checks[0].process.cwd = "build".into();
+    let state_dir = root.path().join("later-cwd");
+    let intake = create_intake(
+        &state_dir,
+        &workspace,
+        "observe".into(),
+        Vec::new(),
+        later_cwd,
+    )
+    .await
+    .unwrap();
+    preflight_intake(&state_dir, Some(&intake.id))
+        .await
+        .unwrap();
+    admit_intake(&state_dir, Some(&intake.id)).await.unwrap();
 
     // A waived check is never dispatched, so it cannot block preflight.
     let mut waived = plan();

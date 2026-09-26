@@ -15,15 +15,23 @@ specification plus the canonical workspace root and declared input manifest.
 Changing arguments, environment, directory, executable, limits, root, inputs, or
 grant revision invalidates prepared work. The controller checks again after
 restart; the executor also rechecks at the launch boundary. Task preflight runs
-the checks that need no grant (platform, limits, absolute executable path, the
-Windows `.exe` rule, executable hash, working directory, and argument and
-environment bounds) on every unwaived check, so a plan that could never launch
-is refused before admission and before any model turn. The executor repeats the
-grant, authorization and input checks after the durable started marker; a
-mismatch there still pauses the run and leaves the action unknown on reopen. If
-only the specification-and-host checks fail at that point, no launch was
-attempted, so the action is recorded as a failure with a
-`refused before launch: …` reason instead of an unknown effect.
+the checks that need neither a grant nor the working directory (platform, limits,
+absolute executable path, the Windows `.exe` rule, executable hash, and argument
+and environment bounds) on every unwaived check at first admission, so a plan
+that names an unlaunchable executable is refused before admission and before any
+model turn. It does not prove a plan launches, and it does not check the working
+directory, which an earlier check may create; each check requires its directory
+when it is prepared.
+
+The executor repeats every check after the durable started marker. A grant,
+authorization or declared-input mismatch, a changed executable, a link or escape
+in the working directory, or an invalid specification is still an error: the run
+pauses with the action started, and reopening makes it unknown. Only an absence
+(a missing executable or working directory) means no launch was attempted, and it
+is recorded as a failure with a `refused before launch: …` reason instead of an
+unknown effect. An admitted verification check's snapshot already covers its
+executable, so for those checks only a missing working directory reaches that
+recorded-failure path.
 
 On Windows the canonical workspace root is a verbatim `\\?\C:\…` path. The
 child's working directory is passed without that prefix when the plain form

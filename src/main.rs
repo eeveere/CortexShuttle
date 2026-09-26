@@ -1279,27 +1279,23 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                 }
                 let action_id =
                     workspace::admission_check_action(&journal, &admission, &check.id).await?;
-                let (receipt, prepared) = match (&run, &action_id) {
+                let (receipt, action_state) = match (&run, &action_id) {
                     (Some(run), Some(action_id)) => {
                         let id = format!("{}/verification/{action_id}", run.id);
                         (
                             journal.verification_receipt(&id).await?,
-                            journal.action(&id).await?.is_some(),
+                            journal.action(&id).await?.map(|action| action.state),
                         )
                     }
-                    _ => (None, false),
+                    _ => (None, None),
                 };
-                // A binding is recorded before its action is prepared, so a
-                // refusal during preparation leaves a binding with no action:
-                // nothing was started, which is not an unknown effect.
-                let status = match &receipt {
-                    Some(view) if view.stale_reason.is_some() => "stale",
-                    Some(view) if view.passed() => "passed",
-                    Some(_) => "failed",
-                    None if prepared => "unknown",
-                    None if action_id.is_some() => "not_prepared",
-                    None => "pending",
-                };
+                let status = admitted_check_status(
+                    receipt
+                        .as_ref()
+                        .map(|view| (view.stale_reason.is_some(), view.passed())),
+                    action_state,
+                    action_id.is_some(),
+                );
                 statuses.push(AdmittedCheckStatus {
                     check_id: check.id.clone(),
                     name: check.name.clone(),
@@ -1702,6 +1698,28 @@ async fn run_admitted_check(
     Ok(receipt)
 }
 
+/// The label for one unwaived check of an admitted suite. A binding is recorded
+/// before its action is prepared, so a refusal during preparation leaves a binding
+/// with no action: nothing was started. A prepared action was likewise never
+/// started, so neither is an unknown effect; only a started or unknown action is.
+/// `receipt` is `(stale, passed)`.
+fn admitted_check_status(
+    receipt: Option<(bool, bool)>,
+    action: Option<cortex_shuttle::journal::ActionState>,
+    bound: bool,
+) -> &'static str {
+    use cortex_shuttle::journal::ActionState;
+    match (receipt, action) {
+        (Some((true, _)), _) => "stale",
+        (Some((false, true)), _) => "passed",
+        (Some((false, false)), _) => "failed",
+        (None, Some(ActionState::Prepared)) => "not_started",
+        (None, Some(_)) => "unknown",
+        (None, None) if bound => "not_prepared",
+        (None, None) => "pending",
+    }
+}
+
 fn admitted_suite_action_id(admission: &TaskAdmission, check_id: &str) -> String {
     let digest = blake3::hash(check_id.as_bytes()).to_hex();
     format!("suite/{}/{}", admission.id, digest)
@@ -1758,4 +1776,35 @@ async fn finalize_run(state_dir: &std::path::Path) -> Result<()> {
     println!("{}", journal.run().await?.context("run missing")?.phase);
     journal.close().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admitted_check_status;
+    use cortex_shuttle::journal::ActionState;
+
+    #[test]
+    fn a_check_is_unknown_only_when_its_action_started() {
+        assert_eq!(admitted_check_status(None, None, false), "pending");
+        assert_eq!(admitted_check_status(None, None, true), "not_prepared");
+        assert_eq!(
+            admitted_check_status(None, Some(ActionState::Prepared), true),
+            "not_started"
+        );
+        for state in [ActionState::Started, ActionState::Unknown] {
+            assert_eq!(admitted_check_status(None, Some(state), true), "unknown");
+        }
+        assert_eq!(
+            admitted_check_status(Some((true, true)), Some(ActionState::Succeeded), true),
+            "stale"
+        );
+        assert_eq!(
+            admitted_check_status(Some((false, true)), Some(ActionState::Succeeded), true),
+            "passed"
+        );
+        assert_eq!(
+            admitted_check_status(Some((false, false)), Some(ActionState::Failed), true),
+            "failed"
+        );
+    }
 }

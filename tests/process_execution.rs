@@ -1,7 +1,7 @@
 #![cfg(any(windows, target_os = "linux"))]
 use cortex_shuttle::{
     adapter::CortexWeaveAdapter,
-    controller::{Controller, Fault, ToolExecutor},
+    controller::{Controller, Fault, Observation, ToolExecutor},
     journal::{ActionIntent, ActionState, Grant, Journal, ToolCall},
     process::{
         Cancellation, ProcessExecutor, ProcessLimits, ProcessReport, ProcessSpec, StopReason,
@@ -936,16 +936,10 @@ impl ToolExecutor for RacesTheLaunchBoundary {
     fn validate(&self, _intent: &ActionIntent, _current: &Grant) -> anyhow::Result<()> {
         Ok(())
     }
-    fn execute(
-        &mut self,
-        intent: &ActionIntent,
-    ) -> anyhow::Result<cortex_shuttle::controller::Observation> {
+    fn execute(&mut self, intent: &ActionIntent) -> anyhow::Result<Observation> {
         self.0.execute(intent)
     }
-    async fn execute_async(
-        &mut self,
-        intent: &ActionIntent,
-    ) -> anyhow::Result<cortex_shuttle::controller::Observation> {
+    async fn execute_async(&mut self, intent: &ActionIntent) -> anyhow::Result<Observation> {
         self.0.execute_async(intent).await
     }
 }
@@ -959,51 +953,138 @@ fn spec_with_executable_bytes(dir: &Path, bytes: &str) -> (PathBuf, ProcessSpec)
     (path, call)
 }
 
-#[tokio::test]
-async fn a_launch_boundary_spec_refusal_is_a_recorded_failure_but_input_drift_is_not() {
-    let _test = PROCESS_TEST.lock().await;
-    let dir = setup();
-    let mut executor = executor(dir.path(), Cancellation::default());
-    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
-    let action = intent(&executor, call);
-    fs::write(&path, "changed executable").unwrap();
-    // The launch-boundary repeat refuses before any spawn: a failed observation.
-    let observation = executor.execute_async(&action).await.unwrap();
+fn spec_in(directory: &str) -> ProcessSpec {
+    let mut call = spec("io");
+    call.cwd = directory.into();
+    call
+}
+
+/// Replace the empty directory `path` with a link to `target`.
+fn replace_directory_with_link(path: &Path, target: &Path) {
+    fs::remove_dir(path).unwrap();
+    #[cfg(target_os = "linux")]
+    std::os::unix::fs::symlink(target, path).unwrap();
+    #[cfg(windows)]
+    {
+        let output = Command::new(r"C:\Windows\System32\cmd.exe")
+            .args(["/d", "/c", "mklink", "/J"])
+            .arg(path)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+fn assert_refused_before_launch(observation: &Observation, detail: &str, input_hash: &str) {
     assert_eq!(observation.state, ActionState::Failed);
-    assert_eq!(observation.input_after_hash, action.input_hash);
+    assert_eq!(observation.input_after_hash, input_hash);
     let report: ProcessReport = serde_json::from_str(&observation.output).unwrap();
     assert_eq!(report.reason, StopReason::SpawnFailed);
     assert!(report.pid.is_none() && report.exit_code.is_none());
     let error = report.spawn_error.unwrap();
     assert!(error.starts_with("refused before launch: "), "{error}");
-    assert!(error.contains("executable identity changed"), "{error}");
+    assert!(error.contains(detail), "{error}");
+}
+
+/// A missing executable or working directory means no launch was attempted, so the
+/// launch-boundary repeat records a failure and not an unknown effect.
+#[tokio::test]
+async fn a_missing_launch_fact_after_the_started_marker_is_a_recorded_failure() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut executor = executor(dir.path(), Cancellation::default());
+
+    fs::create_dir(dir.path().join("work")).unwrap();
+    let action = intent(&executor, spec_in("work"));
+    fs::remove_dir(dir.path().join("work")).unwrap();
+    let observation = executor.execute_async(&action).await.unwrap();
+    assert_refused_before_launch(
+        &observation,
+        "working directory must exist",
+        &action.input_hash,
+    );
+
+    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
+    let action = intent(&executor, call);
+    fs::remove_file(&path).unwrap();
+    let observation = executor.execute_async(&action).await.unwrap();
+    assert_refused_before_launch(&observation, "", &action.input_hash);
     assert!(!dir.path().join("effect.txt").exists());
-    // A changed declared input is still an error, not a recorded failure.
+}
+
+/// Anything other than absence may be tampering, so it keeps pausing the run with
+/// the action started, exactly as before: a changed executable, a link swapped in
+/// for the working directory, and any grant, authorization or input mismatch.
+#[tokio::test]
+async fn other_launch_refusals_after_the_started_marker_stay_errors() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut executor = executor(dir.path(), Cancellation::default());
+
+    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
+    let action = intent(&executor, call);
+    fs::write(&path, "changed executable").unwrap();
+    let error = executor.execute_async(&action).await.err().unwrap();
+    assert!(error.to_string().contains("executable identity changed"));
+
+    // The refusal keeps its own message; it is not relabelled as a missing directory.
+    fs::create_dir(dir.path().join("work")).unwrap();
+    let action = intent(&executor, spec_in("work"));
+    let target = setup();
+    replace_directory_with_link(&dir.path().join("work"), target.path());
+    let error = executor.execute_async(&action).await.err().unwrap();
+    let message = format!("{error:#}");
+    assert!(message.contains("not allowed"), "{message}");
+    assert!(!message.contains("must exist"), "{message}");
+    assert!(!dir.path().join("effect.txt").exists());
+    assert!(!target.path().join("effect.txt").exists());
+
+    let action = intent(&executor, spec("io"));
     fs::write(dir.path().join("input.txt"), "drifted\n").unwrap();
     let error = executor.execute_async(&action).await.err().unwrap();
     assert!(error.to_string().contains("input precondition changed"));
 }
 
-#[tokio::test]
-async fn a_post_start_spec_refusal_records_a_failure_and_never_becomes_unknown() {
-    let _test = PROCESS_TEST.lock().await;
-    let dir = setup();
+async fn racing_harness(root: &Path) -> Controller<RacesTheLaunchBoundary, CortexWeaveAdapter> {
     let Harness {
         journal,
         executor,
         sink,
-    } = open(dir.path(), Cancellation::default()).await;
-    let mut harness = Controller::new(journal, RacesTheLaunchBoundary(executor), sink);
+    } = open(root, Cancellation::default()).await;
+    Controller::new(journal, RacesTheLaunchBoundary(executor), sink)
+}
+
+#[tokio::test]
+async fn a_post_start_absence_records_a_failure_and_never_becomes_unknown() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut harness = racing_harness(dir.path()).await;
     let bindings = harness.bootstrap(Fault::None).await.unwrap();
-    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
-    let action = intent(&harness.executor.0, call);
-    fs::write(&path, "changed executable").unwrap();
+    fs::create_dir(dir.path().join("work")).unwrap();
+    let action = intent(&harness.executor.0, spec_in("work"));
+    fs::remove_dir(dir.path().join("work")).unwrap();
     let record = harness
         .submit(action.clone(), &action.grant, &bindings, Fault::None)
         .await
         .unwrap();
     assert_eq!(record.state, ActionState::Failed);
     harness.flush(Fault::None).await.unwrap();
+    // Nothing ran, so the reserved active time is fully refunded.
+    assert_eq!(
+        harness
+            .journal
+            .run()
+            .await
+            .unwrap()
+            .unwrap()
+            .process_active_ms,
+        0
+    );
     harness.journal.close().await;
     // Reopening keeps the recorded failure; it does not turn into an unknown effect.
     let mut harness = open(dir.path(), Cancellation::default()).await;
@@ -1014,6 +1095,27 @@ async fn a_post_start_spec_refusal_records_a_failure_and_never_becomes_unknown()
         .await
         .unwrap();
     assert_eq!(replay.state, ActionState::Failed);
+    assert!(!dir.path().join("effect.txt").exists());
+}
+
+#[tokio::test]
+async fn a_post_start_refusal_that_is_not_an_absence_leaves_the_action_unknown() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut harness = racing_harness(dir.path()).await;
+    let bindings = harness.bootstrap(Fault::None).await.unwrap();
+    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
+    let action = intent(&harness.executor.0, call);
+    fs::write(&path, "changed executable").unwrap();
+    let error = harness
+        .submit(action.clone(), &action.grant, &bindings, Fault::None)
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("executable identity changed"));
+    harness.journal.close().await;
+    let harness = open(dir.path(), Cancellation::default()).await;
+    let stored = harness.journal.action(&action.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActionState::Unknown);
     assert!(!dir.path().join("effect.txt").exists());
 }
 
