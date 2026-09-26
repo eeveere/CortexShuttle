@@ -1218,8 +1218,8 @@ the obligations above before the capability is advertised or qualified live.
 
 ## S034 — Show admitted edit sessions read-only reference context
 
-2026-09-26. **Accepted design; K5b and K5c implemented and independently reviewed, the
-implementation awaiting the operator's acceptance.** The
+2026-09-26. **Accepted design; K5b and K5c implemented, independently reviewed and
+accepted by the operator on 2026-09-26; K6's live run is still open.** The
 operator accepted it in chat on 2026-09-26, after two independent reviews and a
 revision the same day (see the review record). The design text below is frozen;
 the implementation clarifications at the end record what K5b settled and one
@@ -1840,3 +1840,16 @@ unproven; nothing here claims more than the tests show.
 | 5 | No authority change | Mostly | Read, find and patch on a reference path are rejected and close the session, the patch-only `enum` is pinned, and `apply` and the patch-identity tuple are unchanged by the diff. Not proven: mutation pins on `apply` and the tuple, and a hostile mock worker through the adapter (rejections are injected at the journal boundary). |
 | 6 | Review and offer | Met, except the widget | The surfaces, the offer binding, escaping, the unreadable cases and a real-process test. |
 | 7 | Both platforms | Met | Windows 309 passed and Docker Linux 310 passed, with none failed and 10 ignored on each; formatting and warnings-denied Clippy pass on both. |
+
+### Acceptance of the implementation (2026-09-26, operator)
+
+The operator accepted the implementation of S034 (K5b, K5c and the K5d review) on
+2026-09-26, with the obligations table above in front of them. The acceptance is of
+the code, tests and records as committed (`d843efa` and `ace7f83`). It does not
+change what the table says is unproven: composed-size monotonicity through the real
+adapter, the adapter POST and request-intent size classifications at open, an
+end-to-end revision-1 session golden, mutation pins on `apply` and the patch-identity
+tuple, a hostile mock worker through the adapter, and the terminal widget's own
+drawing of the new rows. It does not satisfy K6, the live run against emCP with the
+7g objective and profile, which is the operator's and still open, and it does not
+establish that the 4B worker can complete the task with this context.
