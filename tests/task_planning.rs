@@ -55,11 +55,16 @@ fn v2_planner(calls: Arc<AtomicUsize>) -> Planner {
 
 /// A scripted S033 v2 editor: it composes a durable request and answers
 /// every turn with one exact hunk against the admitted `src/main.rs`.
-struct PatchProvider(Arc<AtomicUsize>, String);
+struct PatchProvider(Arc<AtomicUsize>, String, String);
 
 impl PatchProvider {
     fn new(calls: Arc<AtomicUsize>) -> Self {
-        Self(calls, format!("{EDIT_PROTOCOL}:{DIGEST}"))
+        Self::replacing(calls, "edited")
+    }
+
+    /// The hunk's replacement text is whatever the model chose to write.
+    fn replacing(calls: Arc<AtomicUsize>, new_utf8: &str) -> Self {
+        Self(calls, format!("{EDIT_PROTOCOL}:{DIGEST}"), new_utf8.into())
     }
 }
 
@@ -93,7 +98,7 @@ impl ModelProvider for PatchProvider {
                     expected_file_hash: file.hash.clone(),
                     hunks: vec![WorkspaceTextHunk {
                         old_utf8: "hello".into(),
-                        new_utf8: "edited".into(),
+                        new_utf8: self.2.clone(),
                     }],
                 }],
             },
@@ -903,6 +908,92 @@ async fn review_offer_binds_the_exact_edit_to_fresh_suite_evidence_and_stales() 
         )
         .await
         .is_err()
+    );
+}
+
+#[tokio::test]
+async fn offer_commands_print_terminal_safe_json_for_hostile_hunks() {
+    const RLO: char = '\u{202e}';
+    const NEL: char = '\u{85}';
+    let (_root, _workspace_root, state, context) = setup().await;
+    let mut config = AppConfig::default();
+    config.database.path = state
+        .join("cortexweave.sqlite")
+        .to_string_lossy()
+        .into_owned();
+    let service = CortexWeaveService::open(config).await.unwrap();
+    let native_workspace = service
+        .register_workspace(&context.workspace_root, "Shuttle hostile hunk")
+        .await
+        .unwrap();
+    drop(service);
+    run_admitted_task_planning(
+        &state,
+        &native_workspace.id,
+        &context,
+        &mut v2_planner(Arc::new(AtomicUsize::new(0))),
+    )
+    .await
+    .unwrap();
+    workspace::grant_task_write_permission(&state, &context.id().unwrap(), "grant-hostile", "r")
+        .await
+        .unwrap();
+    let hostile = format!("ed{RLO}it{NEL}ed");
+    workspace::run_admitted_task_edit(&state, &native_workspace.id, DIGEST, |_| {
+        Ok(PatchProvider::replacing(
+            Arc::new(AtomicUsize::new(0)),
+            &hostile,
+        ))
+    })
+    .await
+    .unwrap();
+    let successor = workspace::readmit_intake(
+        &state,
+        &context.admission_id,
+        "after-hostile-edit",
+        "Patch changed declared inputs",
+    )
+    .await
+    .unwrap();
+    workspace::load_admission(&state, Some(&successor.id))
+        .await
+        .unwrap();
+    run_current_admitted_suite(&state, &successor).await;
+    workspace::offer_task_acceptance(&state, "offer-hostile")
+        .await
+        .unwrap();
+
+    let run = |args: &[&str]| {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_shuttle"))
+            .args(args)
+            .arg("--state-dir")
+            .arg(&state)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let review = run(&["task-offer-review"]);
+    // `task-offer` binds the admission to the harness executable, which is this
+    // test binary here, so only the review command can run as a real process.
+    assert!(
+        !review.contains(RLO) && !review.contains(NEL),
+        "task-offer-review printed a raw hazard character: {review:?}"
+    );
+    assert!(
+        review.contains("\\u202e") && review.contains("\\u0085"),
+        "task-offer-review lost the escaped characters: {review}"
+    );
+    // Escaping keeps the document valid and the hunk's exact value intact.
+    let parsed: serde_json::Value = serde_json::from_str(&review).unwrap();
+    let hunk_text = parsed["change"].to_string();
+    assert!(
+        hunk_text.contains(RLO) && hunk_text.contains(NEL),
+        "task-offer-review changed the hunk's value: {hunk_text}"
     );
 }
 

@@ -1352,11 +1352,17 @@ async fn run_command(command: Box<Command>) -> Result<()> {
             request_key,
         } => {
             let offer = workspace::offer_task_acceptance(&state_dir, &request_key).await?;
-            println!("{}", serde_json::to_string_pretty(&offer)?);
+            println!(
+                "{}",
+                edit_review::json_terminal_safe(&serde_json::to_string_pretty(&offer)?)
+            );
         }
         Command::TaskOfferReview { state_dir } => {
             let offer = workspace::task_acceptance_offer_view(&state_dir).await?;
-            println!("{}", serde_json::to_string_pretty(&offer)?);
+            println!(
+                "{}",
+                edit_review::json_terminal_safe(&serde_json::to_string_pretty(&offer)?)
+            );
         }
         Command::TaskOfferRespond {
             state_dir,
