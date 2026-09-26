@@ -1234,8 +1234,12 @@ list.
   `icu_provider`, `zerotrie` and `cortex-shuttle` artifacts in `target`, not a code
   defect; only those packages were cleaned. Logs are in ignored
   `.shuttle/k3fix2-windows.log` and `.shuttle/k3fix2-docker.log`.
-- Still open from Chunk 7: K4 (the known-broken plan file), the edit-context
-  increment (S034) and step 9's manual terminal records. The optional
+- S034 (admitted edit context sufficiency: read-only reference files, a
+  labelled plan summary and a revision-2 context) was drafted, independently
+  reviewed twice and accepted by the operator on 2026-09-26. Implementation
+  (K5b-K5d) has not started; see S034 in `docs/decisions.md`.
+- Still open from Chunk 7: K4 (the known-broken plan file), S034's K5
+  implementation, K6's live run and step 9's manual terminal records. The optional
   workspace-pollution evidence stays deferred.
 
 ## Milestone 3 scope check (2026-09-21)

@@ -1218,8 +1218,10 @@ the obligations above before the capability is advertised or qualified live.
 
 ## S034 — Show admitted edit sessions read-only reference context
 
-2026-09-26. **Proposed design, revised after an independent review the same day;
-not accepted.** No code, stored byte, bound or profile changes with this text. It
+2026-09-26. **Accepted design; implementation not started.** The operator
+accepted it in chat on 2026-09-26, after two independent reviews and a revision
+the same day (see the review record). No code, stored byte, bound or profile
+changes with this text. It
 is the separately scoped increment that S033's closure clarification (2026-09-25)
 left open. It adds no tool, no permission and no read or write authority, and it
 raises no S033 limit; it does add two new restrictive caps and restates two
@@ -1633,5 +1635,10 @@ a reference path could close the session through a read or find (the
 fields live and how a dropped summary is recorded; turn invariance for the refused-
 read argument; the review plumbing cross-reference; the serde rule; the count
 always being serialized; only size failures moving to the next candidate; the
-escaping arithmetic; and several overbroad statements. A further check of these
-edits is optional.
+escaping arithmetic; and several overbroad statements.
+
+Acceptance (2026-09-26, operator). The operator accepted S034 after those edits,
+without a third independent review of them. Acceptance approves the design and
+authorizes K5b onward; it starts no implementation, changes no code or stored
+byte, and does not satisfy K5d's independent review of the implementation, K4, or
+K6's live run.
