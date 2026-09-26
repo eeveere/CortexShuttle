@@ -14,7 +14,24 @@ environment, and execution/output limits. A grant covers the hash of that entire
 specification plus the canonical workspace root and declared input manifest.
 Changing arguments, environment, directory, executable, limits, root, inputs, or
 grant revision invalidates prepared work. The controller checks again after
-restart; the executor also rechecks at the launch boundary.
+restart; the executor also rechecks at the launch boundary. Task preflight runs
+the checks that need no grant (platform, limits, absolute executable path, the
+Windows `.exe` rule, executable hash, working directory, and argument and
+environment bounds) on every unwaived check, so a plan that could never launch
+is refused before admission and before any model turn. The executor repeats the
+grant, authorization and input checks after the durable started marker; a
+mismatch there still pauses the run and leaves the action unknown on reopen. If
+only the specification-and-host checks fail at that point, no launch was
+attempted, so the action is recorded as a failure with a
+`refused before launch: …` reason instead of an unknown effect.
+
+On Windows the canonical workspace root is a verbatim `\\?\C:\…` path. The
+child's working directory is passed without that prefix when the plain form
+names the same directory, because children inherit it and `cmd.exe` refuses a
+verbatim directory as a UNC path. A path Win32 would rewrite (a trailing dot or
+space, a reserved device name, an invalid character, or more than 258
+characters) stays verbatim. Only the string handed to `CreateProcessW` changes;
+the grant, input precondition, snapshot and receipt keep the canonical root.
 
 There is no implicit PATH search or shell. Windows requires a native `.exe`;
 batch files require an explicitly selected and granted shell. Native Windows
@@ -115,7 +132,7 @@ cargo run --locked -- process-spec --executable C:\Windows\System32\hostname.exe
 Save that JSON as `command.json` (UTF-8), then run:
 
 ```powershell
-cargo run --locked -- process --workspace C:\dev\CortexShuttle --state-dir .shuttle/command-demo --spec command.json --input Cargo.toml --approve-host-execution
+cargo run --locked -- process --workspace C:\den\CortexShuttle --state-dir .shuttle/command-demo --spec command.json --input Cargo.toml --approve-host-execution
 ```
 
 On Linux, generate the spec with an actual executable such as `/usr/bin/printf`

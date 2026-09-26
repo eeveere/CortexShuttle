@@ -292,7 +292,7 @@ under the normal user account. Docker Linux uses a read-only Shuttle source moun
 ```powershell
 docker build -f tests/Dockerfile.qualification -t shuttle-qualification:local .
 docker run --rm --init --cpus 2 --memory 6g `
-  --mount type=bind,source=C:/dev/CortexShuttle,target=/src,readonly `
+  --mount type=bind,source=C:/den/CortexShuttle,target=/src,readonly `
   --mount type=volume,source=shuttle-linux-cargo,target=/usr/local/cargo `
   --mount type=volume,source=shuttle-linux-target,target=/target `
   -e CARGO_TARGET_DIR=/target -w /src shuttle-qualification:local `

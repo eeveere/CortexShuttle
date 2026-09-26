@@ -1279,19 +1279,25 @@ async fn run_command(command: Box<Command>) -> Result<()> {
                 }
                 let action_id =
                     workspace::admission_check_action(&journal, &admission, &check.id).await?;
-                let receipt = match (&run, &action_id) {
+                let (receipt, prepared) = match (&run, &action_id) {
                     (Some(run), Some(action_id)) => {
-                        journal
-                            .verification_receipt(&format!("{}/verification/{action_id}", run.id))
-                            .await?
+                        let id = format!("{}/verification/{action_id}", run.id);
+                        (
+                            journal.verification_receipt(&id).await?,
+                            journal.action(&id).await?.is_some(),
+                        )
                     }
-                    _ => None,
+                    _ => (None, false),
                 };
+                // A binding is recorded before its action is prepared, so a
+                // refusal during preparation leaves a binding with no action:
+                // nothing was started, which is not an unknown effect.
                 let status = match &receipt {
                     Some(view) if view.stale_reason.is_some() => "stale",
                     Some(view) if view.passed() => "passed",
                     Some(_) => "failed",
-                    None if action_id.is_some() => "unknown",
+                    None if prepared => "unknown",
+                    None if action_id.is_some() => "not_prepared",
                     None => "pending",
                 };
                 statuses.push(AdmittedCheckStatus {

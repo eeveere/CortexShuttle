@@ -201,6 +201,17 @@ fn process_probe() {
             )
             .unwrap();
         }
+        #[cfg(windows)]
+        "cwd" => {
+            // A grandchild inherits this directory, as npm's cmd.exe did in the
+            // emCP qualification; cmd.exe refuses a verbatim one as UNC.
+            let cwd = std::env::current_dir().unwrap();
+            fs::write("cwd.txt", cwd.to_string_lossy().as_bytes()).unwrap();
+            let cmd = PathBuf::from(std::env::var("SystemRoot").unwrap()).join(r"System32\cmd.exe");
+            let output = Command::new(cmd).args(["/d", "/c", "cd"]).output().unwrap();
+            fs::write("cmd-stdout.txt", output.stdout).unwrap();
+            fs::write("cmd-stderr.txt", output.stderr).unwrap();
+        }
         "failure" => std::process::exit(7),
         "quiet" => std::process::exit(0),
         "flood" => {
@@ -910,6 +921,102 @@ async fn failed_spawn_is_recorded_but_mutated_executable_is_rejected() {
     );
 }
 
+/// Passes the pre-start validation, then runs the real executor. This reproduces a
+/// change that lands between the controller's checks and the launch-boundary repeat.
+struct RacesTheLaunchBoundary(ProcessExecutor);
+
+#[async_trait::async_trait]
+impl ToolExecutor for RacesTheLaunchBoundary {
+    fn mode(&self) -> &'static str {
+        self.0.mode()
+    }
+    fn input_hash(&self) -> anyhow::Result<String> {
+        self.0.input_hash()
+    }
+    fn validate(&self, _intent: &ActionIntent, _current: &Grant) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn execute(
+        &mut self,
+        intent: &ActionIntent,
+    ) -> anyhow::Result<cortex_shuttle::controller::Observation> {
+        self.0.execute(intent)
+    }
+    async fn execute_async(
+        &mut self,
+        intent: &ActionIntent,
+    ) -> anyhow::Result<cortex_shuttle::controller::Observation> {
+        self.0.execute_async(intent).await
+    }
+}
+
+fn spec_with_executable_bytes(dir: &Path, bytes: &str) -> (PathBuf, ProcessSpec) {
+    let path = dir.join("later-changed.exe");
+    fs::write(&path, bytes).unwrap();
+    let mut call = spec("io");
+    call.executable = path.clone();
+    call.executable_hash = hash_executable(&path).unwrap();
+    (path, call)
+}
+
+#[tokio::test]
+async fn a_launch_boundary_spec_refusal_is_a_recorded_failure_but_input_drift_is_not() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut executor = executor(dir.path(), Cancellation::default());
+    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
+    let action = intent(&executor, call);
+    fs::write(&path, "changed executable").unwrap();
+    // The launch-boundary repeat refuses before any spawn: a failed observation.
+    let observation = executor.execute_async(&action).await.unwrap();
+    assert_eq!(observation.state, ActionState::Failed);
+    assert_eq!(observation.input_after_hash, action.input_hash);
+    let report: ProcessReport = serde_json::from_str(&observation.output).unwrap();
+    assert_eq!(report.reason, StopReason::SpawnFailed);
+    assert!(report.pid.is_none() && report.exit_code.is_none());
+    let error = report.spawn_error.unwrap();
+    assert!(error.starts_with("refused before launch: "), "{error}");
+    assert!(error.contains("executable identity changed"), "{error}");
+    assert!(!dir.path().join("effect.txt").exists());
+    // A changed declared input is still an error, not a recorded failure.
+    fs::write(dir.path().join("input.txt"), "drifted\n").unwrap();
+    let error = executor.execute_async(&action).await.err().unwrap();
+    assert!(error.to_string().contains("input precondition changed"));
+}
+
+#[tokio::test]
+async fn a_post_start_spec_refusal_records_a_failure_and_never_becomes_unknown() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let Harness {
+        journal,
+        executor,
+        sink,
+    } = open(dir.path(), Cancellation::default()).await;
+    let mut harness = Controller::new(journal, RacesTheLaunchBoundary(executor), sink);
+    let bindings = harness.bootstrap(Fault::None).await.unwrap();
+    let (path, call) = spec_with_executable_bytes(dir.path(), "original executable");
+    let action = intent(&harness.executor.0, call);
+    fs::write(&path, "changed executable").unwrap();
+    let record = harness
+        .submit(action.clone(), &action.grant, &bindings, Fault::None)
+        .await
+        .unwrap();
+    assert_eq!(record.state, ActionState::Failed);
+    harness.flush(Fault::None).await.unwrap();
+    harness.journal.close().await;
+    // Reopening keeps the recorded failure; it does not turn into an unknown effect.
+    let mut harness = open(dir.path(), Cancellation::default()).await;
+    let stored = harness.journal.action(&action.id).await.unwrap().unwrap();
+    assert_eq!(stored.state, ActionState::Failed);
+    let replay = harness
+        .submit(action.clone(), &action.grant, &bindings, Fault::None)
+        .await
+        .unwrap();
+    assert_eq!(replay.state, ActionState::Failed);
+    assert!(!dir.path().join("effect.txt").exists());
+}
+
 #[tokio::test]
 async fn process_result_rollback_retains_full_time_reservation_and_unknown_effect() {
     let _test = PROCESS_TEST.lock().await;
@@ -1001,4 +1108,40 @@ fn junction_and_parent_paths_are_rejected() {
     // Remove only the junction itself. Its separately owned target remains intact.
     fs::remove_dir(&link).unwrap();
     assert!(target.path().join("input.txt").exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn a_verbatim_workspace_root_reaches_the_child_as_a_plain_directory() {
+    let _test = PROCESS_TEST.lock().await;
+    let dir = setup();
+    let mut executor = executor(dir.path(), Cancellation::default());
+    // Identities keep the canonical verbatim root; only the spawn string changes.
+    let root = executor.root().to_string_lossy().into_owned();
+    let plain = root
+        .strip_prefix(r"\\?\")
+        .expect("canonical root is verbatim");
+    let intent = intent(&executor, spec("cwd"));
+    let authorization = intent.grant.process_authorization_hash.clone();
+    let observation = executor.execute_async(&intent).await.unwrap();
+    assert_eq!(observation.state, ActionState::Succeeded);
+    assert_eq!(observation.input_after_hash, intent.input_hash);
+    assert_eq!(
+        fs::read_to_string(dir.path().join("cwd.txt")).unwrap(),
+        plain
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("cmd-stdout.txt"))
+            .unwrap()
+            .trim_end(),
+        plain
+    );
+    let stderr = fs::read_to_string(dir.path().join("cmd-stderr.txt")).unwrap();
+    assert!(!stderr.contains("UNC"), "{stderr}");
+    // The authorization still binds the verbatim root, as before the change.
+    assert_eq!(executor.root().to_string_lossy(), root);
+    assert_eq!(
+        Some(executor.authorization_hash(&spec("cwd")).unwrap()),
+        authorization
+    );
 }

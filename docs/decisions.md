@@ -2,7 +2,7 @@
 
 ## S001 — Application boundary and initial repository
 
-2026-09-03. Use `C:/dev/CortexShuttle` for the separate repository, `Shuttle`
+2026-09-03. Use `C:/den/CortexShuttle` for the separate repository, `Shuttle`
 as the product name, `cortex-shuttle` as the development crate, and `shuttle`
 as the executable. The native adapter calls CortexWeave application services.
 Its database schema and SQL remain entirely inside CortexWeave.

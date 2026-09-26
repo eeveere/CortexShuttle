@@ -31,8 +31,8 @@ cargo run --locked -- task
 # The profile is used only by explicit plan/edit confirmations; verification
 # commands require the separate explicit host-execution approval.
 cargo run --locked -- task --state-dir .shuttle\intake-01 `
-  --workspace C:\dev\example --objective "Repair the failing unit tests" `
-  --constraint "Preserve the public API" --plan C:\dev\example\verification-plan.json `
+  --workspace C:\den\example --objective "Repair the failing unit tests" `
+  --constraint "Preserve the public API" --plan C:\den\example\verification-plan.json `
   --profile .shuttle\local-model-profile.json --approve-host-execution
 
 # Read-only durable status (use --json for automation)

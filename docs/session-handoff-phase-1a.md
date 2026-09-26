@@ -1,7 +1,7 @@
 # Shuttle implementation handoff — phase 1a complete
 
 **Prepared:** 2026-09-13  
-**Repository:** `C:\dev\CortexShuttle`  
+**Repository:** `C:\den\CortexShuttle`  
 **Current boundary:** phase 1a is complete. Do **not** begin phase 1b until the user explicitly authorizes the durable write-permission increment and selects the requested model/effort. The recommended setting for phase 1b is **Terra: high**.
 
 ## Scope and non-goals carried forward

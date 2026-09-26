@@ -275,6 +275,124 @@ async fn preflight_binds_a_fresh_snapshot_without_admitting_a_run() {
     assert!(run_demo(&state_dir, Some(&intake.id)).await.is_err());
 }
 
+/// Preflight refuses a check that could never launch, so no model turn is spent
+/// on a plan whose verification is certain to be refused later.
+#[tokio::test]
+async fn preflight_refuses_a_check_that_can_never_launch() {
+    let root = tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(workspace.join("src")).unwrap();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+
+    let mut missing_cwd = plan();
+    missing_cwd.checks[0].process.cwd = "build".into();
+    let mut wrong_hash = plan();
+    wrong_hash.checks[0].process.executable_hash = "0".repeat(64);
+    #[cfg(windows)]
+    let batch = {
+        let script = root.path().join("check.cmd");
+        fs::write(&script, "@exit /b 0\r\n").unwrap();
+        let mut batch = plan();
+        batch.checks[0].process.executable_hash = hash_executable(&script).unwrap();
+        batch.checks[0].process.executable = script;
+        Some(("batch", batch, "use an explicit native .exe"))
+    };
+    #[cfg(not(windows))]
+    let batch = None;
+    let cases = [
+        ("missing-cwd", missing_cwd, "working directory must exist"),
+        ("wrong-hash", wrong_hash, "executable identity changed"),
+    ]
+    .into_iter()
+    .chain(batch);
+    for (name, plan, message) in cases {
+        let state_dir = root.path().join(name);
+        let intake = create_intake(&state_dir, &workspace, "observe".into(), Vec::new(), plan)
+            .await
+            .unwrap();
+        let error = preflight_intake(&state_dir, Some(&intake.id))
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(message), "{name}: {error:#}");
+        let reader = TaskReader::open(&state_dir).await.unwrap();
+        assert_eq!(reader.view().await.unwrap().intake_preflight_snapshot, None);
+        reader.close().await;
+        assert!(admit_intake(&state_dir, Some(&intake.id)).await.is_err());
+    }
+
+    // A waived check is never dispatched, so it cannot block preflight.
+    let mut waived = plan();
+    waived.checks[0].process.executable_hash = "0".repeat(64);
+    waived.waivers.push(Waiver {
+        check_id: "unit".into(),
+        reason: "Not required here.".into(),
+    });
+    let state_dir = root.path().join("waived");
+    let intake = create_intake(&state_dir, &workspace, "observe".into(), Vec::new(), waived)
+        .await
+        .unwrap();
+    preflight_intake(&state_dir, Some(&intake.id))
+        .await
+        .unwrap();
+}
+
+/// A binding recorded for a check whose preparation was then refused has no
+/// action row: nothing was started, so its status is not `unknown`.
+#[tokio::test]
+async fn a_check_refused_during_preparation_reports_not_prepared() {
+    let root = tempdir().unwrap();
+    let workspace = root.path().join("workspace");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(workspace.join("src")).unwrap();
+    fs::create_dir(workspace.join("build")).unwrap();
+    fs::write(workspace.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let state_dir = root.path().join("task");
+    let mut plan = executable_plan();
+    plan.checks[0].process.cwd = "build".into();
+    create_intake(&state_dir, &workspace, "refused".into(), Vec::new(), plan)
+        .await
+        .unwrap();
+    for command in ["task-preflight", "task-admit"] {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_shuttle"))
+            .args([command, "--state-dir"])
+            .arg(&state_dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // The working directory is not a declared input, so admission still holds.
+    fs::remove_dir(workspace.join("build")).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_shuttle"))
+        .args(["task-verify-all", "--state-dir"])
+        .arg(&state_dir)
+        .arg("--approve-host-execution")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("working directory must exist"));
+    let status = std::process::Command::new(env!("CARGO_BIN_EXE_shuttle"))
+        .args(["task-verify-status", "--state-dir"])
+        .arg(&state_dir)
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    let check = &status["checks"][0];
+    assert_eq!(check["check_id"], "unit");
+    assert_eq!(check["status"], "not_prepared");
+    assert!(check["action_id"].is_string());
+    assert!(check["receipt"].is_null());
+}
+
 #[tokio::test]
 async fn admission_requires_a_matching_preflight_and_remains_non_runnable() {
     let root = tempdir().unwrap();

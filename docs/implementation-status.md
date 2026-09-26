@@ -1160,6 +1160,46 @@ This qualifies the protocol, not task success. Still open:
 
 Closing S033 does not close Milestone 3 (see the scope check below).
 
+Executor follow-ups from Chunk 7 (K3, 2026-09-25; the operator's review and
+acceptance are pending, and the focused K3 review has not run):
+- **K3a.** Task preflight now runs the static launch checks on every unwaived
+  check (`validate_process_spec`, shared with the executor), so a plan that
+  could never launch, such as one naming `npm.cmd`, is refused before
+  admission and before any model turn.
+- **K3a.** `task-verify-status` reports `not_prepared` for a check whose
+  preparation was refused; `unknown` is kept for a prepared or started action.
+- **K3b.** On Windows the child's working directory is passed without the
+  `\\?\` prefix when the plain form names the same directory; identities are
+  unchanged.
+- **K3c.** The launch-boundary repeat of the checks, after the durable started
+  marker, is split. A grant, authorization or declared-input mismatch is still
+  an error: the run pauses with the action started, and reopening makes it
+  unknown. A failure of the spec-and-host checks (`validate_process_spec`,
+  such as a changed executable or a missing working directory) means no launch
+  was attempted. It is now recorded as a `Failed` observation with
+  `SpawnFailed` and a bounded `refused before launch: …` reason, so it is a
+  receipt and no longer an unknown effect. This deliberately covers less than
+  the plan's "any pre-spawn re-validation failure": grant or input drift is an
+  integrity signal and keeps its pause. Two tests in
+  `tests/process_execution.rs` pin it: a direct executor test (including that
+  input drift still errors), and a controller test whose wrapper executor
+  passes the pre-start check and then races the launch boundary. Both fail
+  with the change reverted.
+- **K3d.** No change was needed. The Windows environment baseline (`SystemRoot`,
+  `ComSpec`, `PATH`, `TEMP`/`TMP` outside the workspace, `node.exe` with
+  `npm-cli.js`) was already in the manual qualification guide.
+- Gates on the final tree: Windows 269 passed, 0 failed, 10 ignored; Docker
+  Linux (pinned Rust 1.98 / Python 3.14.7 image) 270 passed, 0 failed, 10
+  ignored; formatting and warnings-denied Clippy pass on both. The first
+  Windows test run failed to build because of corrupted `tokio`, `tokio-util`,
+  `icu_provider`, `zerotrie` and `cortex-shuttle` artifacts in `target`, not a
+  code defect. Only those packages were cleaned, and the rebuilt tree passed.
+  Logs are in ignored `.shuttle/k3c-windows-test.log` and
+  `.shuttle/k3c-docker-linux.log`.
+- Still open from Chunk 7: K4 (the known-broken plan file), the edit-context
+  increment (S034) and step 9's manual terminal records. The optional
+  workspace-pollution evidence stays deferred.
+
 ## Milestone 3 scope check (2026-09-21)
 
 The master plan (`docs/.shuttle-priv/dedicated-harness-plan.md`, moved here

@@ -215,19 +215,7 @@ impl ProcessExecutor {
     }
 
     fn resolve(&self, relative: &Path) -> Result<PathBuf> {
-        ensure!(
-            relative
-                .components()
-                .all(|c| matches!(c, Component::Normal(_))),
-            "path must contain only workspace-relative normal components"
-        );
-        let path = self.root.join(relative);
-        check_absolute_path(&path)?;
-        ensure!(
-            path.canonicalize()?.starts_with(&self.root),
-            "path escaped workspace"
-        );
-        Ok(path)
+        resolve_under(&self.root, relative)
     }
 
     fn spec<'a>(&self, intent: &'a ActionIntent) -> Result<&'a ProcessSpec> {
@@ -235,6 +223,30 @@ impl ProcessExecutor {
             ToolCall::RunProcess(spec) => Ok(spec),
             _ => bail!("process executor requires a process call"),
         }
+    }
+
+    /// The grant, authorization and declared-input checks shared by the pre-start
+    /// validation and the launch-boundary repeat. Returns the intent's specification.
+    fn validate_binding<'a>(
+        &self,
+        intent: &'a ActionIntent,
+        current: &Grant,
+    ) -> Result<&'a ProcessSpec> {
+        ensure!(
+            &intent.grant == current,
+            "permission changed; unstarted grant is invalid"
+        );
+        let spec = self.spec(intent)?;
+        ensure!(
+            current.process_authorization_hash.as_deref()
+                == Some(self.authorization_hash(spec)?.as_str()),
+            "exact process grant required"
+        );
+        ensure!(
+            self.input_hash()? == intent.input_hash,
+            "input precondition changed; action was not dispatched"
+        );
+        Ok(spec)
     }
 
     #[cfg(any(windows, target_os = "linux"))]
@@ -283,69 +295,8 @@ impl ToolExecutor for ProcessExecutor {
     }
 
     fn validate(&self, intent: &ActionIntent, current: &Grant) -> Result<()> {
-        ensure!(
-            cfg!(any(windows, target_os = "linux")),
-            "process execution requires Windows 10+ or Linux"
-        );
-        ensure!(
-            &intent.grant == current,
-            "permission changed; unstarted grant is invalid"
-        );
-        let spec = self.spec(intent)?;
-        ensure!(
-            current.process_authorization_hash.as_deref()
-                == Some(self.authorization_hash(spec)?.as_str()),
-            "exact process grant required"
-        );
-        spec.limits.reservation_ms()?;
-        ensure!(
-            self.input_hash()? == intent.input_hash,
-            "input precondition changed; action was not dispatched"
-        );
-        check_absolute_path(&spec.executable)?;
-        ensure!(
-            spec.executable.is_file(),
-            "executable must be a regular file"
-        );
-        #[cfg(windows)]
-        ensure!(
-            spec.executable
-                .extension()
-                .is_some_and(|e| e.eq_ignore_ascii_case("exe")),
-            "use an explicit native .exe; batch files require an explicitly granted shell"
-        );
-        ensure!(
-            hash_executable(&spec.executable)? == spec.executable_hash,
-            "executable identity changed"
-        );
-        ensure!(
-            self.resolve(&spec.cwd)?.is_dir(),
-            "working directory must exist"
-        );
-        ensure!(
-            spec.arguments.len() <= 256 && spec.environment.len() <= 128,
-            "too many arguments/environment entries"
-        );
-        ensure!(
-            serde_json::to_vec(spec)?.len() <= 32_768,
-            "process specification exceeds limit"
-        );
-        ensure!(
-            spec.arguments.iter().all(|s| !s.contains('\0')),
-            "argument contains NUL"
-        );
-        let mut names = std::collections::BTreeSet::new();
-        for (name, value) in &spec.environment {
-            ensure!(
-                !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
-                "invalid environment entry"
-            );
-            ensure!(
-                names.insert(name.to_uppercase()),
-                "case-insensitive environment name collision"
-            );
-        }
-        Ok(())
+        let spec = self.validate_binding(intent, current)?;
+        validate_process_spec(&self.root, spec)
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -355,9 +306,10 @@ impl ToolExecutor for ProcessExecutor {
 
     #[cfg(any(windows, target_os = "linux"))]
     fn execute(&mut self, intent: &ActionIntent) -> Result<Observation> {
-        // Repeat after the durable started marker, immediately before launch.
-        self.validate(intent, &intent.grant)?;
-        let spec = self.spec(intent)?;
+        // Repeat after the durable started marker, immediately before launch. A
+        // grant, authorization or input mismatch stays an error, so the run pauses
+        // with the action started (unknown on reopen).
+        let spec = self.validate_binding(intent, &intent.grant)?;
         let start = Instant::now();
         let mut report = ProcessReport {
             version: 1,
@@ -371,6 +323,19 @@ impl ToolExecutor for ProcessExecutor {
             spawn_error: None,
             tree_stopped: true,
         };
+        // The remaining checks depend only on the specification and this host. Failing
+        // one means no launch was attempted, so it is a recorded failure, not an
+        // unknown effect.
+        if let Err(error) = validate_process_spec(&self.root, spec) {
+            report.reason = StopReason::SpawnFailed;
+            report.spawn_error = Some(
+                format!("refused before launch: {error:#}")
+                    .chars()
+                    .take(512)
+                    .collect(),
+            );
+            return self.observation(report);
+        }
         if self.cancellation.is_cancelled() {
             return self.observation(report);
         }
@@ -453,6 +418,80 @@ impl ToolExecutor for ProcessExecutor {
         guard.0 = None;
         result.context("process worker panicked; completion unknown")?
     }
+}
+
+/// The launch checks that depend only on the specification, the canonical
+/// workspace root and this host, not on a grant or on declared-input state.
+/// Task preflight runs them so a plan that could never launch is refused before
+/// any model turn is spent; `validate` repeats them before every launch.
+pub fn validate_process_spec(root: &Path, spec: &ProcessSpec) -> Result<()> {
+    ensure!(
+        cfg!(any(windows, target_os = "linux")),
+        "process execution requires Windows 10+ or Linux"
+    );
+    spec.limits.reservation_ms()?;
+    check_absolute_path(&spec.executable)?;
+    ensure!(
+        spec.executable.is_file(),
+        "executable must be a regular file"
+    );
+    #[cfg(windows)]
+    ensure!(
+        spec.executable
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe")),
+        "use an explicit native .exe; batch files require an explicitly granted shell"
+    );
+    ensure!(
+        hash_executable(&spec.executable)? == spec.executable_hash,
+        "executable identity changed"
+    );
+    ensure!(
+        resolve_under(root, &spec.cwd)
+            .context("working directory must exist")?
+            .is_dir(),
+        "working directory must exist"
+    );
+    ensure!(
+        spec.arguments.len() <= 256 && spec.environment.len() <= 128,
+        "too many arguments/environment entries"
+    );
+    ensure!(
+        serde_json::to_vec(spec)?.len() <= 32_768,
+        "process specification exceeds limit"
+    );
+    ensure!(
+        spec.arguments.iter().all(|s| !s.contains('\0')),
+        "argument contains NUL"
+    );
+    let mut names = std::collections::BTreeSet::new();
+    for (name, value) in &spec.environment {
+        ensure!(
+            !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0'),
+            "invalid environment entry"
+        );
+        ensure!(
+            names.insert(name.to_uppercase()),
+            "case-insensitive environment name collision"
+        );
+    }
+    Ok(())
+}
+
+fn resolve_under(root: &Path, relative: &Path) -> Result<PathBuf> {
+    ensure!(
+        relative
+            .components()
+            .all(|c| matches!(c, Component::Normal(_))),
+        "path must contain only workspace-relative normal components"
+    );
+    let path = root.join(relative);
+    check_absolute_path(&path)?;
+    ensure!(
+        path.canonicalize()?.starts_with(root),
+        "path escaped workspace"
+    );
+    Ok(path)
 }
 
 pub fn hash_executable(path: &Path) -> Result<String> {

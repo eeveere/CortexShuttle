@@ -141,7 +141,9 @@ impl Process {
     pub fn spawn(spec: &ProcessSpec, cwd: &Path, _supervisor: &Path) -> Result<Self> {
         let _error_mode = ErrorMode::unattended()?;
         let executable = wide(spec.executable.as_os_str())?;
-        let cwd = wide(cwd.as_os_str())?;
+        // Only the string handed to the child changes; every identity keeps the
+        // canonical verbatim root.
+        let cwd = wide(win32_directory(cwd).as_os_str())?;
         let mut command = quote(spec.executable.as_os_str())?;
         for argument in &spec.arguments {
             command.push(' ' as u16);
@@ -366,6 +368,76 @@ impl Process {
 // Closing the non-inherited, kill-on-close job handles both error unwinding and crashes.
 // Do not export the raw job handle or add a breakaway flag to its limits.
 
+/// The child's working directory without the `\\?\` prefix, when the plain
+/// form names the same directory. Children inherit it as their current
+/// directory, and `cmd.exe` refuses a verbatim one as a UNC path. Anything the
+/// Win32 path rules would rewrite keeps the verbatim form: a non-disk prefix, a
+/// `.` or `..` component, a trailing dot or space, a reserved device name, a
+/// character Win32 rejects, or a length over the current-directory limit.
+pub(super) fn win32_directory(path: &Path) -> std::borrow::Cow<'_, Path> {
+    use std::{borrow::Cow, path::Component, path::Prefix};
+    // SetCurrentDirectory: MAX_PATH - 2 characters without the trailing backslash.
+    const MAX_DIRECTORY: usize = 258;
+    let mut components = path.components();
+    let Some(Component::Prefix(prefix)) = components.next() else {
+        return Cow::Borrowed(path);
+    };
+    let Prefix::VerbatimDisk(drive) = prefix.kind() else {
+        return Cow::Borrowed(path);
+    };
+    if !drive.is_ascii_alphabetic() || components.next() != Some(Component::RootDir) {
+        return Cow::Borrowed(path);
+    }
+    let mut plain = format!("{}:\\", drive as char);
+    for (index, component) in components.enumerate() {
+        let Component::Normal(name) = component else {
+            return Cow::Borrowed(path);
+        };
+        let Some(name) = name.to_str() else {
+            return Cow::Borrowed(path);
+        };
+        if !plain_component(name) {
+            return Cow::Borrowed(path);
+        }
+        if index > 0 {
+            plain.push('\\');
+        }
+        plain.push_str(name);
+    }
+    if plain.encode_utf16().count() > MAX_DIRECTORY {
+        return Cow::Borrowed(path);
+    }
+    Cow::Owned(plain.into())
+}
+
+fn plain_component(name: &str) -> bool {
+    const RESERVED: [&str; 6] = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"];
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with(['.', ' '])
+        || name.encode_utf16().count() > 255
+        || name
+            .chars()
+            .any(|c| c < ' ' || matches!(c, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'))
+    {
+        return false;
+    }
+    // Win32 treats the stem, before any extension and trailing spaces, as the device.
+    let stem = name.split('.').next().unwrap_or(name).trim_end_matches(' ');
+    let upper = stem.to_ascii_uppercase();
+    let device = RESERVED.contains(&upper.as_str())
+        || ["COM", "LPT"].iter().any(|base| {
+            upper.strip_prefix(base).is_some_and(|digit| {
+                matches!(
+                    digit,
+                    "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
+        });
+    !device
+}
+
 fn wide(value: &OsStr) -> Result<Vec<u16>> {
     let mut result: Vec<_> = value.encode_wide().collect();
     ensure!(!result.contains(&0), "path contains NUL");
@@ -394,4 +466,58 @@ fn quote(value: &OsStr) -> Result<Vec<u16>> {
     quoted.extend(std::iter::repeat_n(92, slashes * 2));
     quoted.push(34);
     Ok(quoted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::win32_directory;
+    use std::path::Path;
+
+    fn plain(path: &str) -> String {
+        win32_directory(Path::new(path))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn a_verbatim_disk_directory_is_simplified() {
+        assert_eq!(plain(r"\\?\C:\dev\agentic\emCP"), r"C:\dev\agentic\emCP");
+        // std reports the verbatim drive letter in upper case; same directory.
+        assert_eq!(plain(r"\\?\d:\work"), r"D:\work");
+        assert_eq!(plain(r"\\?\C:\"), r"C:\");
+        assert_eq!(plain(r"\\?\C:\dev\a.b\c d"), r"C:\dev\a.b\c d");
+    }
+
+    #[test]
+    fn a_directory_win32_would_rewrite_stays_verbatim() {
+        for path in [
+            r"\\?\C:\dev\trailing.",
+            r"\\?\C:\dev\trailing ",
+            r"\\?\C:\dev\NUL",
+            r"\\?\C:\dev\con.txt",
+            r"\\?\C:\dev\CON .txt",
+            r"\\?\C:\dev\com1",
+            r"\\?\C:\dev\LPT²",
+            r"\\?\C:\dev\CONIN$",
+            r"\\?\C:\dev\a*b",
+            r"\\?\C:\dev\.",
+            r"\\?\C:\dev\..\x",
+            r"\\?\UNC\server\share\dir",
+            r"\\server\share\dir",
+        ] {
+            assert_eq!(plain(path), path, "{path}");
+        }
+        let long = format!(r"\\?\C:\{}", ["a".repeat(200), "b".repeat(60)].join(r"\"));
+        assert_eq!(plain(&long), long);
+    }
+
+    #[test]
+    fn plain_paths_and_the_length_boundary_are_exact() {
+        assert_eq!(plain(r"C:\dev\emCP"), r"C:\dev\emCP");
+        // 258 characters without a trailing backslash is the largest accepted.
+        let fits = format!(r"C:\{}", "a".repeat(255));
+        assert_eq!(plain(&format!(r"\\?\{fits}")), fits);
+        let over = format!(r"\\?\C:\{}\{}", "a".repeat(200), "b".repeat(55));
+        assert_eq!(plain(&over), over);
+    }
 }

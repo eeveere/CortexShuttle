@@ -1167,6 +1167,15 @@ pub async fn preflight_intake(
         ensure!(root.canonicalize()?.to_string_lossy() == intake.workspace_root, "task workspace changed");
         let snapshot = SourceSnapshot::capture(&root, &intake.verification_plan)?;
         ensure!(snapshot.plan_revision == intake.verification_plan_revision, "preflight plan revision mismatch");
+        // A check that could never launch is refused here, before admission and
+        // before any model turn. Waived checks are never dispatched.
+        for check in &intake.verification_plan.checks {
+            if intake.verification_plan.waivers.iter().any(|w| w.check_id == check.id) {
+                continue;
+            }
+            crate::process::validate_process_spec(&snapshot.workspace_root, &check.process)
+                .with_context(|| format!("check {} cannot launch", check.id))?;
+        }
         let mut tx = journal.pool.begin().await?;
         sqlx::query("INSERT OR IGNORE INTO verification_plans(revision, plan_json) VALUES (?, ?)")
             .bind(&intake.verification_plan_revision)
