@@ -1737,6 +1737,10 @@ fn print_task_offer_review(view: &workspace::TaskAcceptanceOfferView) -> Result<
         change.lines().iter().for_each(|line| println!("{line}"));
         println!();
     }
+    if let Some(line) = &view.edit_context {
+        println!("{line}");
+        println!();
+    }
     println!(
         "{}",
         edit_review::json_terminal_safe(&serde_json::to_string_pretty(view)?)

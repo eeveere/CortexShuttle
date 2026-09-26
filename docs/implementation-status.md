@@ -1241,7 +1241,7 @@ list.
   labelled plan summary and a revision-2 context) was drafted, independently
   reviewed twice and accepted by the operator on 2026-09-26. K5b is
   implemented: context revision 2 (reference files, a labelled plan summary and a
-  revision-specific prompt with a permitted-path `enum` on every tool path), the
+  revision-specific prompt with a permitted-path `enum` on the patch tool's paths), the
   fit-at-open candidate loop through a provider factory, the canonical-encoding
   check at load, and a synthetic revision-1 golden that pins the old bytes.
   Windows 299 and Docker Linux 300 tests pass (none failed, 10 ignored on each)
@@ -1253,10 +1253,17 @@ list.
   the patch tool (4 of 4), with 3 of about 27 enum requests running to the token
   limit with no tool call. The operator chose to keep the `enum` on the patch tool
   only, and K5b ships it there (a recorded amendment of S034 Decision 3).
-  Not done: K5c (review and offer surfaces), K5d, and an end-to-end revision-1
-  session golden from a pre-change harness. The size classifications for the
-  adapter POST limit and the request intent are typed but untested at open. See
-  the implementation clarifications at the end of S034.
+  K5c is implemented too: `task-edit-review`, the terminal task view and the
+  offer review show the context revision, the reference files, the omitted count
+  and the plan-summary state (the offer line is bound to the session that prepared
+  its edit), with revision-1 and older-journal output unchanged. Windows 309 passed and Docker Linux 310 passed, with none failed and 10 ignored on each,
+  and a second independent review of the whole increment (K5d) found no read of the
+  workspace, model call or authority in the review and no change to revision-1
+  output; its findings are applied. Not done: the operator's acceptance of the
+  implementation, K6's live run, an end-to-end revision-1 session golden from a
+  pre-change harness, and proof of composed-size monotonicity and of the adapter
+  POST and intent size classifications at open. S034's obligations table lists what
+  is and is not proven; see the clarifications at the end of S034.
 - K4 (2026-09-26): emCP verification plan v2 written and validated by a scratch
   intake and preflight, with no emCP file touched. It replaces the known-broken
   plan file and plan `e`, which named `C:\dev\agentic\emCP` (no longer present),

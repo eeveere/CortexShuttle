@@ -1602,3 +1602,119 @@ async fn a_second_encoding_of_a_stored_definition_is_refused_at_load() {
     );
     journal.close().await;
 }
+
+/// S034 Decision 6 through the read-only task reader: a revision-2 session's
+/// review says what the model was shown. Eight of the eleven eligible reference
+/// files are shown and three omitted; the summary was included.
+#[tokio::test]
+async fn the_task_reader_shows_what_a_revision_two_session_showed_the_model() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    harness.open_session(&mut journal).await;
+    journal.close().await;
+
+    let reader = workspace::TaskReader::open(&harness.state).await.unwrap();
+    let review = reader.edit_review().await.unwrap().unwrap();
+    // The terminal task view reads the same review, so it shows the same context.
+    let view = reader.view().await.unwrap();
+    reader.close().await;
+    assert!(
+        view.review
+            .iter()
+            .any(|line| line.contains("context revision 2: 8 reference file(s) shown")),
+        "{:?}",
+        view.review
+    );
+    let context = review
+        .session
+        .as_ref()
+        .and_then(|session| session.context.as_ref())
+        .expect("a revision-2 session review carries its context");
+    assert_eq!(context.revision, Some(2));
+    assert_eq!(context.reference_files.len(), 8);
+    assert_eq!(context.reference_omitted, Some(3));
+    assert_eq!(
+        context.plan_summary,
+        Some(cortex_shuttle::edit_review::PlanSummaryState::Included)
+    );
+    let shown: Vec<_> = context
+        .reference_files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect();
+    assert_eq!(
+        shown,
+        [
+            "src/other.rs",
+            "src/ref00.rs",
+            "src/ref01.rs",
+            "src/ref02.rs",
+            "src/ref03.rs",
+            "src/ref04.rs",
+            "src/ref05.rs",
+            "src/ref06.rs"
+        ]
+    );
+    let text = review.lines().join("\n");
+    assert!(
+        text.contains(
+            "context revision 2: 8 reference file(s) shown, 3 omitted; plan summary included"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("reference file src/other.rs (source,"),
+        "{text}"
+    );
+    // The JSON review carries the same fields.
+    let json = serde_json::to_string(&review).unwrap();
+    assert!(json.contains("\"reference_omitted\":3"), "{json}");
+}
+
+/// The real `task-edit-review` process, in text and `--json`, for a revision-2
+/// session: the context is printed, and the JSON parses and carries the counts.
+#[tokio::test]
+async fn task_edit_review_prints_the_revision_two_context_in_text_and_json() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    harness.open_session(&mut journal).await;
+    journal.close().await;
+
+    let run = |json: bool| {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_shuttle"));
+        command
+            .args(["task-edit-review", "--state-dir"])
+            .arg(&harness.state);
+        if json {
+            command.arg("--json");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+
+    let text = run(false);
+    assert!(
+        text.contains(
+            "context revision 2: 8 reference file(s) shown, 3 omitted; plan summary included"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("reference file src/other.rs (source,"),
+        "{text}"
+    );
+
+    let review: serde_json::Value = serde_json::from_str(&run(true)).unwrap();
+    let context = &review["session"]["context"];
+    assert_eq!(context["revision"], 2);
+    assert_eq!(context["reference_omitted"], 3);
+    assert_eq!(context["plan_summary"], "included");
+    assert_eq!(context["reference_files"].as_array().unwrap().len(), 8);
+    assert_eq!(context["reference_files"][0]["path"], "src/other.rs");
+    assert!(context.get("unreadable").is_none());
+}

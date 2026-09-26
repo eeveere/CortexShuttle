@@ -1278,8 +1278,9 @@ async fn a_reply_outside_the_protocol_fails_the_turn_without_a_retry() {
 
 /// A new session is context revision 2, and its first serialized request names the
 /// revision, shows the declared-but-ungranted file as a hashless reference file,
-/// carries the labelled plan note, and constrains every tool path to the granted
-/// file. Nothing is dispatched: the request is only composed.
+/// carries the labelled plan note, and constrains the patch's file paths to the
+/// granted file (read and find carry no enum). Nothing is dispatched: the request is
+/// only composed.
 #[tokio::test]
 async fn a_revision_two_request_shows_reference_files_a_labelled_note_and_a_patch_path_enum() {
     let h = Harness::new().await;

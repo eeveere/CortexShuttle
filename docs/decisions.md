@@ -1218,7 +1218,8 @@ the obligations above before the capability is advertised or qualified live.
 
 ## S034 — Show admitted edit sessions read-only reference context
 
-2026-09-26. **Accepted design; K5b implemented, K5c and K5d pending.** The
+2026-09-26. **Accepted design; K5b and K5c implemented and independently reviewed, the
+implementation awaiting the operator's acceptance.** The
 operator accepted it in chat on 2026-09-26, after two independent reviews and a
 revision the same day (see the review record). The design text below is frozen;
 the implementation clarifications at the end record what K5b settled and one
@@ -1726,9 +1727,7 @@ What the tests pin, and what they do not:
   - Whether llama.cpp enforces the path `enum` was tested live (below), and the
     answer is "not reliably". It fails closed either way, since the journal rejects
     a path outside the permission.
-  - K5c is not built: `task-edit-review`, the terminal task view and the offer
-    review do not yet show the context revision, reference files, omissions or
-    summary state (Decision 6).
+  - K5c was built afterwards; see its clarifications below.
 
 ### Live enum probe (2026-09-26, operator-authorized)
 
@@ -1768,3 +1767,76 @@ remove it, exactly as the fail-closed clause of Decision 3 anticipated. On this
 worker it is reliable only for the patch tool and may add a length-overrun risk on
 read and find. The operator chose to keep it on the patch tool only, and K5b now
 ships it there (see the amendment above).
+
+### Implementation clarifications (K5c, 2026-09-26)
+
+K5c implements Decision 6 and is gated: Windows 309 passed and Docker Linux 310 passed, with none failed and 10 ignored on each; formatting and warnings-denied
+Clippy pass on both. An independent Opus : high review (fresh session, read-only)
+found no path by which the review reads the workspace, calls a model or authorizes
+anything, and none that changes revision-1 or older-journal output. Its findings
+are applied:
+
+- **What is shown.** `EditSessionReview` gains an optional `context`: the context
+  revision, each reference file (path, kind, size, preview bytes, truncated), the
+  omitted count and the plan-summary state (included, cut or dropped, with bytes).
+  It renders in `task-edit-review` (text and `--json`) and in the terminal task
+  view, which builds its rows from the same lines. The offer view gains an optional
+  one-line `edit_context`, printed before the offer JSON. Every rendered string is
+  escaped and capped as in Chunk 5, and the JSON goes through the terminal-safe
+  encoder. A path keeps a newline as an escape, and a Linux filename containing a
+  backslash shows with a slash, as the model was shown it.
+- **Revision 1 and older journals are unchanged.** Every new field is skipped when
+  absent, so their output is byte for byte what it was; a JSON-shape test pins the
+  session review, and the historical whole-file offer test asserts its output has
+  no context field at all.
+- **The offer's line is bound to its edit.** The offer asks for the session that
+  prepared the offered action (`admitted_edit_sessions.action_id`), not the most
+  recent session. An offer normally binds an edit prepared by the predecessor
+  admission's session, so recency could print a later session's context beside
+  that edit on the accept surface. The line says "the session that prepared this
+  edit". The session review and the terminal task view still report the latest
+  session beside the latest change, the existing S033 pattern, which is unchanged.
+- **Only genuine revision 1 shows nothing.** The definition is validated, and its
+  encoding required to be canonical, before its revision is trusted, so an explicit
+  revision 1, an unknown revision, a revision-1 definition carrying revision-2
+  content and a second encoding of valid content are reported as unreadable, as
+  the loader would refuse them. An unreadable context claims nothing: its
+  revision, counts and summary state are absent from the JSON.
+- **Old and odd shapes never fail a review.** A definition column that is missing,
+  NULL or the wrong type gives no context or an unreadable note, and a missing
+  action column gives the offer no line. An existing test caught a first version
+  that assumed the column.
+- **Decision 4's downgrade sentence** ("its review still works because
+  `load_session_review` does not read the definition") describes older binaries,
+  which never read it. The K5c review does read it, and reports an unreadable one
+  instead of failing.
+- **Not changed, flagged.** `task-offer` and `task-offer-review` print their offer
+  JSON without the terminal-safe encoder, so existing edit hunks there can carry
+  raw bidirectional characters. The K5c line is pre-escaped and adds no hazard.
+
+Tests and mutation checks: unit tests for every field, state and hostile input;
+database-level loader tests over two sessions and every old shape; reader,
+task-view, offer and real-process (`task-edit-review`, text and `--json`) tests.
+Reverting any of the following was caught: the two serde skips, revision 1 showing
+a context, validation before the revision branch, the offer's action binding, the
+old-journal column guard, the BLOB cast, path escaping, and the offer wiring.
+
+Not covered: the terminal widget's own drawing of the extra rows (they come from
+the same lines the task view already renders), and an offer over a real two-session
+journal end to end (the binding is tested over stored rows).
+
+### Status against the obligations (K5d review, 2026-09-26)
+
+The independent review of the whole S034 implementation, against the seven
+obligations above. "Partly" means the guarantee holds but a listed part is
+unproven; nothing here claims more than the tests show.
+
+| # | Obligation | Status | What is proven, and what is not |
+| --- | --- | --- | --- |
+| 1 | Revision-1 golden and downgrade | Partly | Golden identity and byte round trip, the pinned system prompt (against `HEAD`), prompt and schemas, the fail-closed older-reader shape, and revision-1 review and offer output. Not proven: an older binary's review actually working (argued), and a revision-1 session opened and prepared end to end. |
+| 2 | Revision-2 projection and caps | Met | The validation matrix, the UTF-8 cut, the cap of eight with the rest cleared, hashless reference files and the labelled note. |
+| 3 | Fit at open | Partly | Drop order, only size failures move on, a refused open writes nothing, freshness first, small `n_ctx`, and hostile control-character previews forcing a drop. Not proven: monotone shrinking of the composed context, POST and intent through the real adapter (it is asserted for the definition, with a synthetic provider), a drop forced by backslash or quote previews, and the adapter POST and intent classifications. |
+| 4 | One function, turn invariance | Partly | Turn invariance is pinned, and the S033 read-fit tests now run on revision-2 sessions. No test targets a read shortened because of the reference context. |
+| 5 | No authority change | Mostly | Read, find and patch on a reference path are rejected and close the session, the patch-only `enum` is pinned, and `apply` and the patch-identity tuple are unchanged by the diff. Not proven: mutation pins on `apply` and the tuple, and a hostile mock worker through the adapter (rejections are injected at the journal boundary). |
+| 6 | Review and offer | Met, except the widget | The surfaces, the offer binding, escaping, the unreadable cases and a real-process test. |
+| 7 | Both platforms | Met | Windows 309 passed and Docker Linux 310 passed, with none failed and 10 ignored on each; formatting and warnings-denied Clippy pass on both. |

@@ -194,6 +194,10 @@ pub struct TaskAcceptanceOfferView {
     /// part of the offer's identity.
     #[serde(default)]
     pub change: Option<crate::edit_review::EditReview>,
+    /// One line on what the edit model was shown (context revision 2 only). Derived
+    /// when read; absent for revision 1, so its offer output is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_context: Option<String>,
 }
 
 /// Immutable explicit user response for one admitted-task review offer.
@@ -728,12 +732,19 @@ async fn task_acceptance_offer_view_locked(
         }
         None => None,
     };
+    let edit_context = {
+        let mut conn = journal.pool.acquire().await?;
+        crate::edit_review::load_context_review(&mut conn, &offer.change_action_id)
+            .await?
+            .map(|context| context.summary_line())
+    };
     Ok(Some(TaskAcceptanceOfferView {
         offer,
         evidence,
         stale_reason,
         decision,
         change,
+        edit_context,
     }))
 }
 

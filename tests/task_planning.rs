@@ -803,6 +803,29 @@ async fn review_offer_binds_the_exact_edit_to_fresh_suite_evidence_and_stales() 
         successor.preflight_snapshot
     );
     assert!(offer.stale_reason.is_none());
+    // A revision-2 session says what the edit model was shown, in one line.
+    let context_line = offer
+        .edit_context
+        .as_deref()
+        .expect("a revision-2 session shows its context on the offer");
+    assert!(
+        context_line
+            .starts_with("Edit context of the session that prepared this edit: revision 2, "),
+        "{context_line}"
+    );
+    // It is the line for the session the review reports, counts and all.
+    let reader = workspace::TaskReader::open(&state).await.unwrap();
+    let reviewed = reader.edit_review().await.unwrap().unwrap();
+    reader.close().await;
+    assert_eq!(
+        context_line,
+        reviewed.session.unwrap().context.unwrap().summary_line()
+    );
+    assert!(
+        serde_json::to_string(&offer)
+            .unwrap()
+            .contains("\"edit_context\"")
+    );
     // The offer carries the exact edit under review, not just its identity.
     let change = offer.change.as_ref().expect("offer view shows its edit");
     assert_eq!(change.action_id, edit.intent.id);
@@ -1203,6 +1226,14 @@ async fn a_historical_whole_file_edit_still_offers_and_accepts_without_showing_i
         .unwrap();
     assert_eq!(offer.offer.change_action_id, edit.id);
     assert!(offer.stale_reason.is_none());
+    // A historical whole-file edit has no revision-2 session: its offer output
+    // carries no context field at all.
+    assert!(offer.edit_context.is_none());
+    assert!(
+        !serde_json::to_string(&offer)
+            .unwrap()
+            .contains("edit_context")
+    );
     let change = offer.change.as_ref().expect("offer view shows its edit");
     let lines = change.lines().join("\n");
     assert!(lines.contains("whole-file (historical)"), "{lines}");

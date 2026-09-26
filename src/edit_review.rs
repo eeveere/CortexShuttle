@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
 
 use crate::{
-    edit_session::PATCH_PREPARED,
+    edit_session::{AdmittedEditSessionDefinition, CONTEXT_REVISION_REFERENCE, PATCH_PREPARED},
     journal::{ActionRecord, ActionState, ResolvedWorkspaceTextHunk, ToolCall},
 };
 
@@ -80,6 +80,189 @@ pub struct EditSessionReview {
     /// `open`, `closed: patch prepared`, or `closed: <reason>`.
     pub outcome: String,
     pub turn_notes: Vec<String>,
+    /// What the edit model was shown at open (S034 context revision 2). Absent for
+    /// revision 1 and for journals with no session, so their output is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextReview>,
+}
+
+/// Whether the plan summary reached the edit model, and in what form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanSummaryState {
+    Included,
+    /// Cut on a UTF-8 boundary to the summary cap.
+    Cut,
+    /// Dropped by the fit rule at open.
+    Dropped,
+}
+
+/// One read-only reference file the edit model saw a preview of.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReferenceFileReview {
+    pub path: String,
+    pub kind: String,
+    pub size_bytes: u64,
+    pub preview_bytes: u32,
+    pub preview_truncated: bool,
+}
+
+/// The read-only context a revision-2 session showed the model: which reference
+/// files, how many eligible ones were left out, and the state of the plan summary.
+/// It is derived from the frozen session definition; it never reads the workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextReview {
+    /// Absent when the stored definition could not be read: an unreadable
+    /// definition claims nothing, so every fact below is then absent too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u32>,
+    /// Set when the stored definition could not be read or is inconsistent. The
+    /// review is still shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+    /// The reference files shown. Empty (and then omitted from the JSON) also when
+    /// none were shown; `reference_omitted` distinguishes that from unreadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_files: Vec<ReferenceFileReview>,
+    /// Eligible reference entries that were not shown (the cap or the fit rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_omitted: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_summary: Option<PlanSummaryState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_summary_bytes: Option<u32>,
+}
+
+impl ContextReview {
+    fn unreadable(reason: &str) -> Self {
+        Self {
+            revision: None,
+            unreadable: Some(bounded_reason(reason)),
+            reference_files: Vec::new(),
+            reference_omitted: None,
+            plan_summary: None,
+            plan_summary_bytes: None,
+        }
+    }
+
+    /// `None` for a revision-1 definition, which carries no such context. A
+    /// definition that cannot be parsed or fails its own consistency rules is
+    /// reported as unreadable instead of failing the review.
+    pub fn from_definition_bytes(bytes: &[u8]) -> Option<Self> {
+        let definition: AdmittedEditSessionDefinition = match serde_json::from_slice(bytes) {
+            Ok(definition) => definition,
+            Err(error) => return Some(Self::unreadable(&error.to_string())),
+        };
+        // The same rules the loader applies, before any revision is trusted: an
+        // explicit revision 1, an unknown revision, a revision-1 definition that
+        // carries revision-2 content and a second encoding of the same content are
+        // all refused there, so none may be shown here as if the model saw them.
+        if let Err(error) = definition.validate() {
+            return Some(Self::unreadable(&format!("{error:#}")));
+        }
+        if serde_json::to_vec(&definition).ok().as_deref() != Some(bytes) {
+            return Some(Self::unreadable(
+                "the stored definition is not in its canonical encoding",
+            ));
+        }
+        if definition.context_revision() != CONTEXT_REVISION_REFERENCE {
+            return None;
+        }
+        let shown = match definition.reference_files() {
+            Ok(shown) => shown,
+            Err(error) => return Some(Self::unreadable(&format!("{error:#}"))),
+        };
+        let reference_files = shown
+            .iter()
+            .map(|file| ReferenceFileReview {
+                path: file.path.to_string_lossy().replace('\\', "/"),
+                kind: serde_json::to_value(&file.kind)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                size_bytes: file.bytes,
+                preview_bytes: u32::try_from(file.utf8_preview.as_deref().map_or(0, str::len))
+                    .unwrap_or(u32::MAX),
+                preview_truncated: file.preview_truncated,
+            })
+            .collect();
+        let (plan_summary, plan_summary_bytes) = match &definition.plan_summary {
+            None => (PlanSummaryState::Dropped, 0),
+            Some(summary) => (
+                if definition.plan_summary_truncated {
+                    PlanSummaryState::Cut
+                } else {
+                    PlanSummaryState::Included
+                },
+                u32::try_from(summary.len()).unwrap_or(u32::MAX),
+            ),
+        };
+        Some(Self {
+            revision: Some(definition.context_revision()),
+            unreadable: None,
+            reference_files,
+            reference_omitted: Some(definition.reference_omitted.unwrap_or(0)),
+            plan_summary: Some(plan_summary),
+            plan_summary_bytes: Some(plan_summary_bytes),
+        })
+    }
+
+    fn summary_text(&self) -> String {
+        let bytes = self.plan_summary_bytes.unwrap_or(0);
+        match self.plan_summary {
+            Some(PlanSummaryState::Included) => format!("included ({bytes} B)"),
+            Some(PlanSummaryState::Cut) => format!("cut to {bytes} B"),
+            Some(PlanSummaryState::Dropped) | None => "dropped".into(),
+        }
+    }
+
+    /// One line, for surfaces that have no room for the list (the offer review). The
+    /// offer supplies the context of the session that prepared the offered edit.
+    pub fn summary_line(&self) -> String {
+        if let Some(reason) = &self.unreadable {
+            return format!(
+                "Edit context of the session that prepared this edit: the stored definition could not be read ({reason})."
+            );
+        }
+        format!(
+            "Edit context of the session that prepared this edit: revision {}, {} reference file(s) shown ({} omitted), plan summary {}.",
+            self.revision.unwrap_or(0),
+            self.reference_files.len(),
+            self.reference_omitted.unwrap_or(0),
+            self.summary_text()
+        )
+    }
+
+    /// Escaped, capped review lines: the counts, then each reference file.
+    pub fn lines(&self) -> Vec<String> {
+        if let Some(reason) = &self.unreadable {
+            return vec![format!(
+                "  context: the stored session definition could not be read ({reason})"
+            )];
+        }
+        let mut lines = vec![format!(
+            "  context revision {}: {} reference file(s) shown, {} omitted; plan summary {}",
+            self.revision.unwrap_or(0),
+            self.reference_files.len(),
+            self.reference_omitted.unwrap_or(0),
+            self.summary_text()
+        )];
+        for file in &self.reference_files {
+            lines.push(format!(
+                "    reference file {} ({}, {} B, preview {} B{})",
+                bounded_path(&file.path),
+                bounded_path(&file.kind),
+                file.size_bytes,
+                file.preview_bytes,
+                if file.preview_truncated {
+                    ", truncated"
+                } else {
+                    ""
+                }
+            ));
+        }
+        lines
+    }
 }
 
 /// The current admitted edit, as one reviewable unit.
@@ -193,10 +376,24 @@ fn short(hash: &str) -> String {
 /// One line, escaped and capped at `MAX_REASON_CHARS` *displayed* characters.
 /// A cut lands between escapes, never inside one, and is always marked.
 fn bounded_reason(text: &str) -> String {
+    bounded(text, true)
+}
+
+/// `bounded_reason` for a path or a name: a newline is escaped like any other
+/// control character instead of being shown as a space.
+fn bounded_path(text: &str) -> String {
+    bounded(text, false)
+}
+
+fn bounded(text: &str, flatten_newlines: bool) -> String {
     let mut reason = String::new();
     let mut shown = 0;
     for c in text.chars() {
-        let c = if c == '\n' { ' ' } else { c };
+        let c = if flatten_newlines && c == '\n' {
+            ' '
+        } else {
+            c
+        };
         let mut piece = String::new();
         push_escaped(&mut piece, c);
         let width = piece.chars().count();
@@ -436,6 +633,9 @@ impl EditSessionReview {
         if let Some(reason) = &self.reads_closed_reason {
             lines.push(format!("  reads closed: {reason}"));
         }
+        if let Some(context) = &self.context {
+            lines.extend(context.lines());
+        }
         lines.extend(self.turn_notes.iter().map(|note| format!("  {note}")));
         lines
     }
@@ -462,8 +662,14 @@ pub async fn load_session_review(conn: &mut SqliteConnection) -> Result<Option<E
     } else {
         "NULL"
     };
+    // A journal shape without the stored definition still reviews, with no context.
+    let definition = if has_session_column(&mut *conn, "definition_json").await? {
+        "CAST(definition_json AS BLOB)"
+    } else {
+        "NULL"
+    };
     let Some(row) = sqlx::query(&format!(
-        "SELECT id, read_count, read_bytes, terminal_reason, {closed} AS closed FROM admitted_edit_sessions ORDER BY rowid DESC LIMIT 1"
+        "SELECT id, read_count, read_bytes, terminal_reason, {closed} AS closed, {definition} AS definition FROM admitted_edit_sessions ORDER BY rowid DESC LIMIT 1"
     ))
     .fetch_optional(&mut *conn)
     .await?
@@ -471,6 +677,9 @@ pub async fn load_session_review(conn: &mut SqliteConnection) -> Result<Option<E
         return Ok(None);
     };
     let session_id: String = row.try_get("id")?;
+    let context = row
+        .try_get::<Option<Vec<u8>>, _>("definition")?
+        .and_then(|bytes| ContextReview::from_definition_bytes(&bytes));
     let terminal: Option<String> = row.try_get("terminal_reason")?;
     let closed: Option<String> = row.try_get("closed")?;
     let mut turn_notes = Vec::new();
@@ -516,7 +725,48 @@ pub async fn load_session_review(conn: &mut SqliteConnection) -> Result<Option<E
             Some(reason) => format!("closed: {}", bounded_reason(reason)),
         },
         turn_notes,
+        context,
     }))
+}
+
+async fn has_session_column(conn: &mut SqliteConnection, column: &str) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('admitted_edit_sessions') WHERE name = ?)",
+    )
+    .bind(column)
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// The context of the session that prepared `change_action_id`, for surfaces
+/// without a session review of their own (the offer review). The session is found
+/// by the action it recorded, not by recency: an offer normally binds an edit from
+/// the predecessor admission's session, and a later session under the current
+/// admission must not be shown beside that edit. `None` for revision 1, for an
+/// action no session prepared (a historical whole-file edit), for a journal that
+/// never had a session and for one from before migration 0022.
+pub async fn load_context_review(
+    conn: &mut SqliteConnection,
+    change_action_id: &str,
+) -> Result<Option<ContextReview>> {
+    let has_table: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'admitted_edit_sessions')",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !has_table
+        || !has_session_column(&mut *conn, "definition_json").await?
+        || !has_session_column(&mut *conn, "action_id").await?
+    {
+        return Ok(None);
+    }
+    let bytes: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT CAST(definition_json AS BLOB) FROM admitted_edit_sessions WHERE action_id = ? ORDER BY rowid DESC LIMIT 1",
+    )
+    .bind(change_action_id)
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(bytes.and_then(|bytes| ContextReview::from_definition_bytes(&bytes)))
 }
 
 /// Review of one action by ID, with its completion artifact fetched and
@@ -1001,5 +1251,417 @@ mod tests {
         let mut record = record(ActionState::Succeeded, vec![], None);
         record.intent.call = ToolCall::ReadFixture;
         assert!(EditReview::from_action(&record, None).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // S034 Decision 6: the context a revision-2 session showed the model
+    // -----------------------------------------------------------------------
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/edit_session_definition_rev1.json");
+
+    fn definition() -> AdmittedEditSessionDefinition {
+        serde_json::from_str(FIXTURE).unwrap()
+    }
+
+    /// The fixture as a revision-2 definition that shows `package.json`.
+    fn revision_two() -> AdmittedEditSessionDefinition {
+        let mut definition = definition();
+        definition.context_revision = Some(CONTEXT_REVISION_REFERENCE);
+        definition.reference_omitted = Some(2);
+        definition.plan_summary = Some("Reword the paragraph.".into());
+        for file in &mut definition.initial_context.files {
+            if file.path == std::path::Path::new("package.json") {
+                file.utf8_preview = Some("{\"scripts\":{}}".into());
+            }
+        }
+        definition
+    }
+
+    fn bytes(definition: &AdmittedEditSessionDefinition) -> Vec<u8> {
+        serde_json::to_vec(definition).unwrap()
+    }
+
+    #[test]
+    fn a_revision_two_definition_reviews_its_reference_files_and_summary() {
+        let review = ContextReview::from_definition_bytes(&bytes(&revision_two())).unwrap();
+        assert_eq!(review.revision, Some(2));
+        assert!(review.unreadable.is_none());
+        assert_eq!(review.reference_omitted, Some(2));
+        assert_eq!(review.plan_summary, Some(PlanSummaryState::Included));
+        assert_eq!(review.plan_summary_bytes, Some(21));
+        assert_eq!(
+            review.reference_files,
+            [ReferenceFileReview {
+                path: "package.json".into(),
+                kind: "dependency_manifest".into(),
+                size_bytes: 900,
+                preview_bytes: 14,
+                preview_truncated: true,
+            }]
+        );
+        let lines = review.lines();
+        assert_eq!(
+            lines[0],
+            "  context revision 2: 1 reference file(s) shown, 2 omitted; plan summary included (21 B)"
+        );
+        assert_eq!(
+            lines[1],
+            "    reference file package.json (dependency_manifest, 900 B, preview 14 B, truncated)"
+        );
+        assert_eq!(
+            review.summary_line(),
+            "Edit context of the session that prepared this edit: revision 2, 1 reference file(s) shown (2 omitted), plan summary included (21 B)."
+        );
+    }
+
+    #[test]
+    fn the_plan_summary_state_is_included_cut_or_dropped() {
+        let mut cut = revision_two();
+        cut.plan_summary_truncated = true;
+        let review = ContextReview::from_definition_bytes(&bytes(&cut)).unwrap();
+        assert_eq!(review.plan_summary, Some(PlanSummaryState::Cut));
+        assert!(review.lines()[0].contains("plan summary cut to 21 B"));
+
+        let mut dropped = revision_two();
+        dropped.plan_summary = None;
+        let review = ContextReview::from_definition_bytes(&bytes(&dropped)).unwrap();
+        assert_eq!(review.plan_summary, Some(PlanSummaryState::Dropped));
+        assert_eq!(review.plan_summary_bytes, Some(0));
+        assert!(review.lines()[0].ends_with("plan summary dropped"));
+    }
+
+    #[test]
+    fn revision_two_with_no_reference_files_says_none_were_shown() {
+        let mut none = revision_two();
+        for file in &mut none.initial_context.files {
+            if file.path == std::path::Path::new("package.json") {
+                file.utf8_preview = None;
+            }
+        }
+        none.reference_omitted = Some(0);
+        let review = ContextReview::from_definition_bytes(&bytes(&none)).unwrap();
+        assert!(review.reference_files.is_empty());
+        assert_eq!(review.reference_omitted, Some(0));
+        assert_eq!(review.lines().len(), 1);
+        assert!(review.lines()[0].contains("0 reference file(s) shown, 0 omitted"));
+        // Readable and empty is not unreadable: the JSON still carries the count.
+        let json = serde_json::to_string(&review).unwrap();
+        assert!(json.contains("\"reference_omitted\":0") && !json.contains("unreadable"));
+    }
+
+    #[test]
+    fn a_genuine_revision_one_definition_has_no_context() {
+        assert!(ContextReview::from_definition_bytes(FIXTURE.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn a_definition_the_loader_would_refuse_is_never_shown_as_seen() {
+        let mut explicit_one = definition();
+        explicit_one.context_revision = Some(1);
+        let mut unknown = definition();
+        unknown.context_revision = Some(3);
+        let mut carries_revision_two = definition();
+        carries_revision_two.plan_summary = Some("smuggled".into());
+        let mut shows_a_preview = definition();
+        for file in &mut shows_a_preview.initial_context.files {
+            if file.path == std::path::Path::new("package.json") {
+                file.utf8_preview = Some("{}".into());
+            }
+        }
+        let mut missing_count = revision_two();
+        missing_count.reference_omitted = None;
+        let mut oversize_summary = revision_two();
+        oversize_summary.plan_summary = Some("s".repeat(5_000));
+        // A second encoding of valid revision-2 content: an explicit false flag.
+        let mut second_encoding = String::from_utf8(bytes(&revision_two())).unwrap();
+        second_encoding.pop();
+        second_encoding.push_str(",\"plan_summary_truncated\":false}");
+        for (name, broken) in [
+            ("garbage", b"not json".to_vec()),
+            ("explicit revision 1", bytes(&explicit_one)),
+            ("unknown revision", bytes(&unknown)),
+            (
+                "revision 1 with revision-2 fields",
+                bytes(&carries_revision_two),
+            ),
+            (
+                "revision 1 with a reference preview",
+                bytes(&shows_a_preview),
+            ),
+            ("missing omitted count", bytes(&missing_count)),
+            ("oversize summary", bytes(&oversize_summary)),
+            ("non-canonical encoding", second_encoding.into_bytes()),
+        ] {
+            let review = ContextReview::from_definition_bytes(&broken)
+                .unwrap_or_else(|| panic!("{name} must be reported, not shown as revision 1"));
+            assert!(review.unreadable.is_some(), "{name}");
+            // An unreadable definition claims nothing, in text or in JSON.
+            assert!(
+                review.revision.is_none() && review.reference_omitted.is_none(),
+                "{name}"
+            );
+            assert!(
+                review.plan_summary.is_none() && review.reference_files.is_empty(),
+                "{name}"
+            );
+            assert!(review.lines()[0].contains("could not be read"), "{name}");
+            assert!(
+                review.summary_line().contains("could not be read"),
+                "{name}"
+            );
+            let json = serde_json::to_string(&review).unwrap();
+            assert!(json.contains("unreadable"), "{name}: {json}");
+            for fact in [
+                "\"revision\"",
+                "reference_omitted",
+                "plan_summary",
+                "reference_files",
+            ] {
+                assert!(!json.contains(fact), "{name}: {json} must not carry {fact}");
+            }
+        }
+    }
+
+    #[test]
+    fn hostile_file_names_are_escaped_and_capped() {
+        let mut definition = revision_two();
+        for file in &mut definition.initial_context.files {
+            if file.path == std::path::Path::new("package.json") {
+                file.path = std::path::PathBuf::from(format!(
+                    "evil\u{1b}[31m\u{202e}na\nme{}.json",
+                    "x".repeat(600)
+                ));
+            }
+        }
+        let review = ContextReview::from_definition_bytes(&bytes(&definition)).unwrap();
+        let lines = review.lines();
+        let text = lines.join("\n");
+        for hazard in ['\u{1b}', '\u{202e}'] {
+            assert!(!text.contains(hazard), "raw {hazard:?} reached the display");
+        }
+        // A newline in a path is escaped, so it can neither break the row nor look
+        // like a space.
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(
+            text.contains("na\\u{a}me") || text.contains("na\\nme"),
+            "{text}"
+        );
+        assert!(
+            text.contains('…'),
+            "an over-long path must be cut with a marker"
+        );
+        // The JSON form goes through the terminal-safe encoder before it is printed.
+        let json = json_terminal_safe(&serde_json::to_string_pretty(&review).unwrap());
+        assert!(!json.contains('\u{1b}') && !json.contains('\u{202e}'));
+    }
+
+    #[test]
+    fn revision_one_session_review_keeps_its_exact_json_shape() {
+        let review = EditSessionReview {
+            session_id: "s".into(),
+            turns: 1,
+            reads: 0,
+            read_bytes: 0,
+            reads_closed_reason: None,
+            outcome: "open".into(),
+            turn_notes: vec![],
+            context: None,
+        };
+        let text = serde_json::to_string(&review).unwrap();
+        assert_eq!(
+            text,
+            r#"{"session_id":"s","turns":1,"reads":0,"read_bytes":0,"reads_closed_reason":null,"outcome":"open","turn_notes":[]}"#
+        );
+        // Output written before context existed still reads back.
+        let back: EditSessionReview = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, review);
+        // With a context the field appears, and the lines gain its rows.
+        let mut with = review.clone();
+        with.context = ContextReview::from_definition_bytes(&bytes(&revision_two()));
+        assert!(
+            serde_json::to_string(&with)
+                .unwrap()
+                .contains("\"context\"")
+        );
+        assert!(
+            with.lines()
+                .iter()
+                .any(|line| line.contains("context revision 2"))
+        );
+        assert!(
+            !review
+                .lines()
+                .iter()
+                .any(|line| line.contains("context revision"))
+        );
+    }
+
+    /// The loaders read the stored definition from the session table. Both sessions
+    /// below are revision 2; the offer must show the one that prepared its edit, not
+    /// the most recent one. Older shapes (no definition column, no action column, a
+    /// NULL or mistyped definition) still review, with no context or an unreadable
+    /// note, and never an error.
+    #[tokio::test]
+    async fn the_loaders_show_the_context_of_the_session_that_prepared_the_edit() {
+        use sqlx::Connection;
+
+        /// A stored session: its id, the action it prepared and its definition bytes.
+        type SessionRow<'a> = (&'a str, Option<&'a str>, Option<Vec<u8>>);
+
+        async fn journal(rows: &[SessionRow<'_>], shape: &str) -> sqlx::SqliteConnection {
+            let mut conn = sqlx::SqliteConnection::connect("sqlite::memory:")
+                .await
+                .unwrap();
+            let columns = match shape {
+                "full" => ", definition_json BLOB, action_id TEXT",
+                "no action column" => ", definition_json BLOB",
+                _ => "",
+            };
+            for statement in [
+                format!("CREATE TABLE admitted_edit_sessions(id TEXT, read_count INTEGER, read_bytes INTEGER, terminal_reason TEXT{columns})"),
+                "CREATE TABLE admitted_edit_turns(session_id TEXT, turn_index INTEGER, request_id TEXT)".into(),
+                "CREATE TABLE model_requests(id TEXT, state TEXT, application TEXT)".into(),
+                "CREATE TABLE actions(sequence INTEGER PRIMARY KEY, intent_json TEXT, state TEXT, result_json TEXT)".into(),
+                "CREATE TABLE artifacts(hash TEXT PRIMARY KEY, bytes BLOB)".into(),
+            ] {
+                sqlx::query(&statement).execute(&mut conn).await.unwrap();
+            }
+            for (id, action, definition) in rows {
+                match shape {
+                    "full" => {
+                        sqlx::query(
+                            "INSERT INTO admitted_edit_sessions VALUES (?, 0, 0, NULL, ?, ?)",
+                        )
+                        .bind(id)
+                        .bind(definition.clone())
+                        .bind(action)
+                        .execute(&mut conn)
+                        .await
+                        .unwrap();
+                    }
+                    "no action column" => {
+                        sqlx::query("INSERT INTO admitted_edit_sessions VALUES (?, 0, 0, NULL, ?)")
+                            .bind(id)
+                            .bind(definition.clone())
+                            .execute(&mut conn)
+                            .await
+                            .unwrap();
+                    }
+                    _ => {
+                        sqlx::query("INSERT INTO admitted_edit_sessions VALUES (?, 0, 0, NULL)")
+                            .bind(id)
+                            .execute(&mut conn)
+                            .await
+                            .unwrap();
+                    }
+                }
+            }
+            conn
+        }
+
+        let mut earlier = revision_two();
+        earlier.reference_omitted = Some(2);
+        let mut later = revision_two();
+        later.reference_omitted = Some(7);
+        let rows = [
+            ("earlier-session", Some("action-x"), Some(bytes(&earlier))),
+            ("later-session", None, Some(bytes(&later))),
+        ];
+
+        // The session review shows the latest session, as it always has; the offer
+        // asks for the session that prepared its action.
+        let mut conn = journal(&rows, "full").await;
+        let review = load_session_review(&mut conn).await.unwrap().unwrap();
+        assert_eq!(review.context.as_ref().unwrap().reference_omitted, Some(7));
+        assert!(review.lines().iter().any(|line| line.contains("7 omitted")));
+        let bound = load_context_review(&mut conn, "action-x")
+            .await
+            .unwrap()
+            .expect("the session that prepared the action");
+        assert_eq!(
+            bound.reference_omitted,
+            Some(2),
+            "not the later session's 7"
+        );
+        assert!(bound.summary_line().contains("(2 omitted)"));
+        // An action no session prepared (a historical whole-file edit) has no line.
+        assert!(
+            load_context_review(&mut conn, "some-other-action")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Revision 1: no context anywhere, so the output is what it always was.
+        let mut conn = journal(
+            &[("s", Some("action-x"), Some(FIXTURE.as_bytes().to_vec()))],
+            "full",
+        )
+        .await;
+        let review = load_session_review(&mut conn).await.unwrap().unwrap();
+        assert!(review.context.is_none());
+        assert!(!serde_json::to_string(&review).unwrap().contains("context"));
+        assert!(
+            load_context_review(&mut conn, "action-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A NULL definition and shapes without the columns review, with no context.
+        let mut conn = journal(&[("s", Some("action-x"), None)], "full").await;
+        assert!(
+            load_session_review(&mut conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .context
+                .is_none()
+        );
+        let mut conn = journal(&[("s", None, Some(bytes(&earlier)))], "no action column").await;
+        assert!(
+            load_session_review(&mut conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .context
+                .is_some()
+        );
+        assert!(
+            load_context_review(&mut conn, "action-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let mut conn = journal(&[("s", None, None)], "neither").await;
+        assert!(
+            load_session_review(&mut conn)
+                .await
+                .unwrap()
+                .unwrap()
+                .context
+                .is_none()
+        );
+        assert!(
+            load_context_review(&mut conn, "action-x")
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // A definition stored with the wrong type must not fail the review: it is
+        // reported as unreadable, on both the session review and the offer.
+        let mut conn = journal(&[("s", Some("action-x"), None)], "full").await;
+        sqlx::query("UPDATE admitted_edit_sessions SET definition_json = 12345")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let review = load_session_review(&mut conn).await.unwrap().unwrap();
+        assert!(review.context.as_ref().unwrap().unreadable.is_some());
+        let offer = load_context_review(&mut conn, "action-x")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(offer.summary_line().contains("could not be read"));
     }
 }
