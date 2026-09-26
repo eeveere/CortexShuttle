@@ -1246,11 +1246,19 @@ list.
   plan file and plan `e`, which named `C:\dev\agentic\emCP` (no longer present),
   drops the `--prefix` workaround, declares four inputs sized to the preview pool
   and the edit-context budget, and adds a read-only `doc-scripts-exist` check. See
-  [the record](manual-qualifications/emcp-plan-v2.md). The model-free baseline run
-  against emCP is the operator's step and has not been run.
-- Still open from Chunk 7: K4's baseline run, S034's K5 implementation, K6's live
-  run and step 9's manual terminal records. The optional workspace-pollution
-  evidence stays deferred.
+  [the record](manual-qualifications/emcp-plan-v2.md). The operator ran the
+  model-free baseline against emCP the same day (`.shuttle\k4-baseline`): both
+  checks passed, the emCP tree was clean before and after, and the plan revision
+  and preflight snapshot matched the scratch validation. It also confirmed the
+  K3b working-directory change live: `full-check` passed with no `--prefix`. The
+  test and reference counts and the duration were not captured in the receipts.
+  One deviation is recorded: the baseline intake holds a hand-typed constraint
+  ("agents.MD") that differs from 7g's; it affects nothing in that run, and K6
+  must use a new state directory and the exact 7g text, checked by hash before
+  its intake.
+- K4 is complete. Still open from Chunk 7: S034's K5 implementation, K6's live run
+  and step 9's manual terminal records. The optional workspace-pollution evidence
+  stays deferred.
 
 ## Milestone 3 scope check (2026-09-21)
 

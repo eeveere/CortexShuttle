@@ -86,8 +86,8 @@ the missing references, 2 means the check itself could not run. It writes nothin
   Preflight ran the K3a launch checks on both checks. No process was dispatched and
   no model was called.
 - `git status --porcelain` in emCP was empty before and after (HEAD `a652789`).
-- Not done: the model-free baseline run. It executes `npm run check` in emCP, so it
-  is the operator's step.
+- The model-free baseline run executes `npm run check` in emCP, so the operator ran
+  it afterwards; see "Baseline outcome" below.
 
 ## Operator baseline run (model-free)
 
@@ -114,6 +114,66 @@ environment lost `TEMP`/`TMP`. Either is a finding to record, not a reason to ed
 the plan silently. If the `node.exe` hash no longer matches after a Node upgrade,
 regenerate the specifications with `shuttle process-spec` and expect a new plan
 revision.
+
+### Before K6's intake
+
+K6 needs its own new state directory. Do not reuse `.shuttle\k4-baseline`; an
+intake is immutable and a state directory cannot be reset.
+
+K6 must also use the exact objective and constraint text of attempt 7g, which is
+what `$obj` and `$con` above contain. Paste them from this record; do not retype
+them. The baseline run below was affected by exactly that slip. Before
+`task-intake`, compare both strings with 7g's by SHA-256 of their UTF-8 text (no
+trailing newline):
+
+```powershell
+function Get-Sha256($s) { [BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($s))).Replace('-','').ToLower() }
+Get-Sha256 $obj   # expect b224840975b69884e00326a6f1e3d5f44bb01a4a837bc5df9553ee2014987475
+Get-Sha256 $con   # expect 78a598b04607f62503ede7e3edfbfa06021c3fa8e4255c0400bb7ee71b27aa9b
+```
+
+Those two values are the hashes of 7g's saved objective and constraint, read from
+its journal. The snippet was run against the text above and reproduces them; a
+constraint with `agents.MD` in place of `AGENTS.md` hashes to `d56c6258…` and does
+not match. If either value differs, stop and fix the string before the intake.
+
+## Baseline outcome (operator run, 2026-09-26)
+
+The operator ran the runbook above in `.shuttle\k4-baseline`, with no model and
+`--approve-host-execution` for the two checks. Result: **passed.**
+
+- **Tree state.** `git -C C:\den\agentic\emCP status --porcelain` was empty before
+  and after the run.
+- **Identities.** Intake `03045198-3257-4c64-a74a-ceeba8d664a2`, admission
+  `4f04a764-3707-4188-8fbe-b9d4fe45124a`, run
+  `6d66e622-2930-414b-8b1c-aae8f48eb145`. The plan revision is
+  `20f0565b0588fb44a3aed10297c0a3279639bc0f673be6d54528e40e6cd15928`, and the
+  preflight snapshot is
+  `d1b19495e5a7d61ed1b64025a32a413a4e336a72c92a306e9b253b7994a45824`. Both are
+  identical to the scratch validation above.
+- **Verification.** `task-intake`, `task-preflight` and `task-admit` succeeded, and
+  `task-verify-all` reported `full-check` and `doc-scripts-exist` both succeeded.
+  `task-verify-status` shows both `passed`, with no stale reason, equal pre- and
+  post-snapshots and no waivers. Suite evidence is null, as expected: the run did
+  not include `task-verify-evidence`. A read-only look at the journal
+  (`mode=ro&immutable=1`) agrees: two `verification_receipts` with no stale reason,
+  and two actions in state `succeeded`.
+- **K3b confirmed live.** `full-check` ran with no `--prefix` and `cwd ""` and
+  passed, so the verbatim working-directory fix works against the real emCP check.
+- **Not confirmed.** The "19 test files, 125 tests" and "28 references" figures and
+  the run duration are not in the receipts (stdout is not kept there), so this run
+  does not confirm them. Only the pass status is established.
+
+**Deviation.** The operator typed the constraint by hand and wrote
+"Modify agents.MD only" instead of "Modify AGENTS.md only". Intakes are immutable,
+so `.shuttle\k4-baseline` permanently holds the lowercase wording; the journal
+confirms it, and the objective there does equal 7g's. It does not affect this
+run: no model was called, the constraint is not part of the plan revision (the
+revision matches the scratch validation, whose text was correct), and the state
+directory is spent anyway. It is recorded so nobody mistakes that intake's
+constraint for 7g's, and it is the reason for the K6 comparison above. The
+runbook's text was already exact; it equals 7g's saved objective and constraint
+character for character.
 
 ## Plan file
 
