@@ -24,7 +24,8 @@ use crate::{
     requests::{RequestIntent, RequestRecord, RequestResult},
     verification::{bounded_json, identity},
     workspace::{
-        AdmittedTaskContext, MAX_WORKSPACE_TEXT_PATCH_FILE_BYTES, TaskWritePermission,
+        AdmittedTaskContext, AdmittedTaskFile, MAX_WORKSPACE_TEXT_PATCH_FILE_BYTES,
+        TASK_CONTEXT_FILE_PREVIEW_BYTES, TASK_CONTEXT_PREVIEW_BYTES, TaskWritePermission,
         canonical_text_patch_path, current_write_permission_view,
     },
 };
@@ -37,6 +38,41 @@ pub const MAX_EDIT_READ_BYTES: usize = 6_144;
 pub const MAX_READ_EXCERPT_BYTES: usize = 2_048;
 pub const MAX_READ_OBSERVATION_BYTES: usize = 16_384;
 const MAX_EDIT_CONTEXT_BYTES: usize = 24_000;
+
+/// S034 context revision 2: the session definition also carries bounded
+/// read-only reference previews and a labelled plan summary. Absent means 1.
+pub const CONTEXT_REVISION_REFERENCE: u32 = 2;
+/// At most this many non-permitted files are shown as reference files.
+pub const MAX_REFERENCE_FILES: usize = 8;
+/// The plan summary is cut on a UTF-8 boundary to this many bytes.
+pub const MAX_PLAN_SUMMARY_BYTES: usize = 1_024;
+
+/// A composed edit request that does not fit one of the size bounds (the durable
+/// context, the POST body, `n_ctx` or the request intent). S034 lets session
+/// open move to a smaller candidate only for this kind of failure; every other
+/// error, such as a wrong profile or an invalid definition, is returned at once.
+#[derive(Debug)]
+pub struct RequestTooLarge(pub String);
+
+impl std::fmt::Display for RequestTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RequestTooLarge {}
+
+/// An error that reports a size-bound failure, for `is_request_too_large`.
+pub fn too_large(message: impl Into<String>) -> anyhow::Error {
+    anyhow::Error::new(RequestTooLarge(message.into()))
+}
+
+/// Whether `error` (or a cause) is a size-bound failure of a composed request.
+pub fn is_request_too_large(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.downcast_ref::<RequestTooLarge>().is_some())
+}
 
 /// The journal's side of "a read can still succeed", one independently pinned
 /// clause each. Review finding F1 (2026-09-19): a single `ensure!` with `&&`
@@ -148,6 +184,10 @@ mod turn_budget_tests {
             initial_context_hash: identity("shuttle-edit-initial-context-v2\0", &initial_context)
                 .unwrap(),
             initial_context,
+            context_revision: None,
+            plan_summary: None,
+            plan_summary_truncated: false,
+            reference_omitted: None,
         };
         AdmittedEditTurnContext {
             session_id: session_id(&session).unwrap(),
@@ -200,6 +240,236 @@ mod turn_budget_tests {
     }
 }
 
+/// S034 obligation 1: a revision-1 definition, as saved by earlier code, still
+/// round-trips to the same bytes and keeps its session identity and
+/// `initial_context_hash`. The fixture is synthetic but structurally identical to
+/// a stored definition; its expected values were computed by the code that wrote
+/// revision 1, before context revision 2 existed.
+#[cfg(test)]
+mod revision_one_golden {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/edit_session_definition_rev1.json");
+
+    #[test]
+    fn a_saved_revision_one_definition_keeps_its_bytes_and_identity() {
+        let definition: AdmittedEditSessionDefinition = serde_json::from_str(FIXTURE).unwrap();
+        assert_eq!(serde_json::to_string(&definition).unwrap(), FIXTURE);
+        assert_eq!(
+            identity(
+                "shuttle-edit-initial-context-v2\0",
+                &definition.initial_context
+            )
+            .unwrap(),
+            definition.initial_context_hash
+        );
+        assert_eq!(
+            session_id(&definition).unwrap(),
+            "dfd9a87f8961825dbd18d24088858500095bf64ae8ee38192fae429716b99cca"
+        );
+    }
+}
+
+/// S034: the consistency rules `validate` enforces between the context revision
+/// and the fields and previews it allows, the UTF-8 cut of the plan summary, the
+/// always-serialized omission count, and the fail-closed downgrade.
+#[cfg(test)]
+mod definition_validation {
+    use super::*;
+
+    const FIXTURE: &str = include_str!("../tests/fixtures/edit_session_definition_rev1.json");
+
+    fn revision_one() -> AdmittedEditSessionDefinition {
+        serde_json::from_str(FIXTURE).unwrap()
+    }
+
+    fn show(definition: &mut AdmittedEditSessionDefinition, path: &str, preview: &str) {
+        let file = definition
+            .initial_context
+            .files
+            .iter_mut()
+            .find(|f| f.path == Path::new(path))
+            .unwrap();
+        file.utf8_preview = Some(preview.into());
+    }
+
+    fn revision_two() -> AdmittedEditSessionDefinition {
+        let mut definition = revision_one();
+        definition.context_revision = Some(CONTEXT_REVISION_REFERENCE);
+        definition.reference_omitted = Some(0);
+        show(&mut definition, "package.json", "{}");
+        definition
+    }
+
+    fn rejection(definition: &AdmittedEditSessionDefinition) -> String {
+        format!("{:#}", definition.validate().unwrap_err())
+    }
+
+    /// Extra non-permitted files, each with the given preview.
+    fn add_references(definition: &mut AdmittedEditSessionDefinition, count: usize, preview: &str) {
+        let template = definition
+            .initial_context
+            .files
+            .iter()
+            .find(|f| f.path == Path::new("package.json"))
+            .unwrap()
+            .clone();
+        for index in 0..count {
+            let mut file = template.clone();
+            file.path = PathBuf::from(format!("extra/ref{index}.txt"));
+            file.utf8_preview = Some(preview.into());
+            definition.initial_context.files.push(file);
+        }
+    }
+
+    #[test]
+    fn both_revisions_validate() {
+        revision_one().validate().unwrap();
+        revision_two().validate().unwrap();
+        assert_eq!(revision_one().context_revision(), 1);
+        assert_eq!(revision_two().context_revision(), 2);
+        assert_eq!(revision_two().reference_files().unwrap().len(), 1);
+        // Revision 1 never has reference files, even if a preview were present.
+        assert!(revision_one().reference_files().unwrap().is_empty());
+    }
+
+    #[test]
+    fn revision_one_carries_no_revision_two_content() {
+        let mut definition = revision_one();
+        definition.plan_summary = Some("note".into());
+        assert!(rejection(&definition).contains("revision-2 fields"));
+
+        let mut definition = revision_one();
+        definition.plan_summary_truncated = true;
+        assert!(rejection(&definition).contains("revision-2 fields"));
+
+        let mut definition = revision_one();
+        definition.reference_omitted = Some(0);
+        assert!(rejection(&definition).contains("revision-2 fields"));
+
+        // A non-permitted preview is revision-2 content.
+        let mut definition = revision_one();
+        show(&mut definition, "package.json", "{}");
+        assert!(rejection(&definition).contains("not permitted"));
+    }
+
+    #[test]
+    fn an_explicit_revision_one_or_an_unknown_revision_is_rejected() {
+        for revision in [0, 1, 3] {
+            let mut definition = revision_one();
+            definition.context_revision = Some(revision);
+            assert!(rejection(&definition).contains("unsupported edit context revision"));
+        }
+    }
+
+    #[test]
+    fn revision_two_requires_its_omitted_count() {
+        let mut definition = revision_two();
+        definition.reference_omitted = None;
+        assert!(rejection(&definition).contains("omitted reference count"));
+    }
+
+    #[test]
+    fn revision_two_enforces_every_cap_when_loaded() {
+        // At most eight reference entries: package.json plus eight more is nine.
+        let mut definition = revision_two();
+        add_references(&mut definition, MAX_REFERENCE_FILES, "x");
+        assert!(rejection(&definition).contains("too many reference files"));
+        // Exactly eight is fine.
+        let mut definition = revision_two();
+        add_references(&mut definition, MAX_REFERENCE_FILES - 1, "x");
+        definition.validate().unwrap();
+
+        // An empty preview on a non-permitted file is not a reference entry.
+        let mut definition = revision_two();
+        show(&mut definition, "package.json", "");
+        assert!(rejection(&definition).contains("not permitted"));
+
+        // 1,024 bytes per preview, 4,096 in total.
+        let mut definition = revision_two();
+        show(&mut definition, "package.json", &"y".repeat(1_025));
+        assert!(rejection(&definition).contains("per-file cap"));
+        let mut definition = revision_two();
+        add_references(&mut definition, 4, &"z".repeat(1_024));
+        assert!(rejection(&definition).contains("total cap"));
+
+        // The summary: non-empty, at most 1,024 bytes, and a dropped one is not
+        // truncated.
+        let mut definition = revision_two();
+        definition.plan_summary = Some("s".repeat(MAX_PLAN_SUMMARY_BYTES));
+        definition.validate().unwrap();
+        definition.plan_summary = Some("s".repeat(MAX_PLAN_SUMMARY_BYTES + 1));
+        assert!(rejection(&definition).contains("plan summary is outside its bounds"));
+        definition.plan_summary = Some(String::new());
+        assert!(rejection(&definition).contains("plan summary is outside its bounds"));
+        let mut definition = revision_two();
+        definition.plan_summary_truncated = true;
+        assert!(rejection(&definition).contains("cannot be marked truncated"));
+    }
+
+    #[test]
+    fn the_plan_summary_is_cut_on_a_utf8_boundary() {
+        assert_eq!(cut_utf8("abc", 3), ("abc".to_string(), false));
+        assert_eq!(cut_utf8("abcd", 3), ("abc".to_string(), true));
+        // A three-byte character straddling the limit is dropped whole.
+        let (text, truncated) = cut_utf8(&"€".repeat(400), MAX_PLAN_SUMMARY_BYTES);
+        assert!(truncated);
+        assert_eq!(text.len(), 1_023);
+        assert!(text.chars().all(|c| c == '€'));
+        assert_eq!(cut_utf8("é", 1), (String::new(), true));
+    }
+
+    #[test]
+    fn revision_two_always_serializes_its_count_and_revision_one_never_does() {
+        let two = serde_json::to_string(&revision_two()).unwrap();
+        assert!(two.contains("\"context_revision\":2"));
+        assert!(two.contains("\"reference_omitted\":0"));
+        assert!(!two.contains("plan_summary"), "a dropped summary is absent");
+        let mut with_summary = revision_two();
+        with_summary.plan_summary = Some("note".into());
+        with_summary.plan_summary_truncated = true;
+        let text = serde_json::to_string(&with_summary).unwrap();
+        assert!(text.contains("\"plan_summary\":\"note\""));
+        assert!(text.contains("\"plan_summary_truncated\":true"));
+        let one = serde_json::to_string(&revision_one()).unwrap();
+        for field in [
+            "context_revision",
+            "reference_omitted",
+            "plan_summary",
+            "plan_summary_truncated",
+        ] {
+            assert!(
+                !one.contains(field),
+                "revision 1 must not serialize {field}"
+            );
+        }
+    }
+
+    /// The shape of a definition before context revision 2, with the same
+    /// `deny_unknown_fields`. An older binary reading a revision-2 journal fails
+    /// closed at load, before any code that closes a session.
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    #[allow(dead_code)]
+    struct RevisionOneShape {
+        version: u32,
+        bounds_revision: u32,
+        protocol: String,
+        run_id: String,
+        profile_digest: String,
+        permission: TaskWritePermission,
+        initial_context: AdmittedTaskContext,
+        initial_context_hash: String,
+    }
+
+    #[test]
+    fn an_older_reader_rejects_revision_two_and_still_reads_revision_one() {
+        assert!(serde_json::from_str::<RevisionOneShape>(FIXTURE).is_ok());
+        let two = serde_json::to_string(&revision_two()).unwrap();
+        assert!(serde_json::from_str::<RevisionOneShape>(&two).is_err());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdmittedEditSessionDefinition {
@@ -212,6 +482,129 @@ pub struct AdmittedEditSessionDefinition {
     /// Frozen projection: all declared-file identities, previews on granted paths only.
     pub initial_context: AdmittedTaskContext,
     pub initial_context_hash: String,
+    /// S034. Absent means revision 1, so a revision-1 definition serializes to
+    /// the same bytes as before and keeps its session identity. The loader
+    /// recomputes the identity from the re-serialized definition, so every field
+    /// here must be skipped when it holds its revision-1 value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_revision: Option<u32>,
+    /// Revision 2: the planning summary cut to `MAX_PLAN_SUMMARY_BYTES`. Absent
+    /// means it was dropped (the planning decoder guarantees a non-empty one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan_summary_truncated: bool,
+    /// Revision 2, always serialized: eligible reference entries not shown, a
+    /// count and not a list so that each drop step shrinks the definition.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reference_omitted: Option<u32>,
+}
+
+impl AdmittedEditSessionDefinition {
+    pub fn context_revision(&self) -> u32 {
+        self.context_revision.unwrap_or(1)
+    }
+
+    fn is_permitted(&self, file: &AdmittedTaskFile) -> Result<bool> {
+        let path = file
+            .path
+            .to_str()
+            .context("non-UTF-8 declared path")?
+            .replace('\\', "/");
+        Ok(self.permission.allowed_paths.contains(&path))
+    }
+
+    /// Revision 2: the non-permitted files whose previews the model is shown.
+    pub fn reference_files(&self) -> Result<Vec<&AdmittedTaskFile>> {
+        let mut shown = Vec::new();
+        if self.context_revision() == CONTEXT_REVISION_REFERENCE {
+            for file in &self.initial_context.files {
+                if !self.is_permitted(file)?
+                    && file.utf8_preview.as_deref().is_some_and(|p| !p.is_empty())
+                {
+                    shown.push(file);
+                }
+            }
+        }
+        Ok(shown)
+    }
+
+    /// Consistency between the revision and the fields and previews it allows.
+    /// The loader and every turn context call it, so a definition cannot present
+    /// revision-2 content as revision 1, or exceed a revision-2 cap, however it
+    /// reached the journal.
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            matches!(
+                self.context_revision,
+                None | Some(CONTEXT_REVISION_REFERENCE)
+            ),
+            "unsupported edit context revision"
+        );
+        let revision_two = self.context_revision == Some(CONTEXT_REVISION_REFERENCE);
+        let mut preview_bytes = 0usize;
+        let mut reference = 0usize;
+        for file in &self.initial_context.files {
+            let preview = file.utf8_preview.as_deref();
+            let length = preview.map_or(0, str::len);
+            ensure!(
+                length <= TASK_CONTEXT_FILE_PREVIEW_BYTES,
+                "edit context preview exceeds its per-file cap"
+            );
+            preview_bytes += length;
+            if let (false, Some(text)) = (self.is_permitted(file)?, preview) {
+                ensure!(
+                    revision_two && !text.is_empty(),
+                    "edit context shows a preview of a file that is not permitted"
+                );
+                reference += 1;
+            }
+        }
+        ensure!(
+            preview_bytes <= TASK_CONTEXT_PREVIEW_BYTES,
+            "edit context previews exceed their total cap"
+        );
+        if !revision_two {
+            ensure!(
+                self.plan_summary.is_none()
+                    && !self.plan_summary_truncated
+                    && self.reference_omitted.is_none(),
+                "revision-1 edit definition carries revision-2 fields"
+            );
+            return Ok(());
+        }
+        ensure!(
+            self.reference_omitted.is_some(),
+            "revision-2 edit definition must record its omitted reference count"
+        );
+        ensure!(
+            reference <= MAX_REFERENCE_FILES,
+            "edit context shows too many reference files"
+        );
+        match &self.plan_summary {
+            Some(summary) => ensure!(
+                !summary.is_empty() && summary.len() <= MAX_PLAN_SUMMARY_BYTES,
+                "edit context plan summary is outside its bounds"
+            ),
+            None => ensure!(
+                !self.plan_summary_truncated,
+                "a dropped plan summary cannot be marked truncated"
+            ),
+        }
+        Ok(())
+    }
+}
+
+/// Cut `text` to at most `limit` bytes on a UTF-8 boundary.
+fn cut_utf8(text: &str, limit: usize) -> (String, bool) {
+    if text.len() <= limit {
+        return (text.to_string(), false);
+    }
+    let mut end = limit;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    (text[..end].to_string(), true)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -315,6 +708,7 @@ impl AdmittedEditTurnContext {
                 && valid_profile_digest(&session.profile_digest),
             "edit turn context is not admitted editing v2"
         );
+        session.validate()?;
         ensure!(
             session_id(session)? == self.session_id,
             "edit turn context session identity mismatch"
@@ -464,10 +858,9 @@ fn compose_edit_context(
         replan_direction: None,
         observations,
     };
-    ensure!(
-        serde_json::to_vec(&context)?.len() <= MAX_EDIT_CONTEXT_BYTES,
-        "edit history exceeds request allowance"
-    );
+    if serde_json::to_vec(&context)?.len() > MAX_EDIT_CONTEXT_BYTES {
+        return Err(too_large("edit history exceeds request allowance"));
+    }
     Ok(context)
 }
 
@@ -494,14 +887,14 @@ fn compose_edit_intent(
     // The wire adapter also validates output allowance plus n_ctx.
     if let Some(exchanges) = wire["exchanges"].as_array() {
         for exchange in exchanges.iter().filter(|e| e["method"] == "POST") {
-            ensure!(
-                exchange["body"]
-                    .as_str()
-                    .context("missing exact POST body")?
-                    .len()
-                    <= 24_000,
-                "serialized edit POST exceeds request bound"
-            );
+            if exchange["body"]
+                .as_str()
+                .context("missing exact POST body")?
+                .len()
+                > 24_000
+            {
+                return Err(too_large("serialized edit POST exceeds request bound"));
+            }
         }
     }
     let intent = RequestIntent {
@@ -517,7 +910,7 @@ fn compose_edit_intent(
         timeout_ms: model.timeout_ms(),
         serialized_request: Some(wire),
     };
-    bounded_json(&intent)?;
+    bounded_json(&intent).map_err(|error| too_large(error.to_string()))?;
     Ok(intent)
 }
 
@@ -528,8 +921,16 @@ impl Journal {
             .bind(id)
             .fetch_one(&self.pool)
             .await?;
-        let definition: AdmittedEditSessionDefinition =
-            serde_json::from_slice(&row.try_get::<Vec<u8>, _>("definition_json")?)?;
+        let stored = row.try_get::<Vec<u8>, _>("definition_json")?;
+        let definition: AdmittedEditSessionDefinition = serde_json::from_slice(&stored)?;
+        // Every stored definition was written as `serde_json::to_vec` of this
+        // struct, so its bytes equal a re-serialization. A second encoding of the
+        // same content (an explicit null, a false flag) would otherwise load
+        // under the same identity.
+        ensure!(
+            serde_json::to_vec(&definition)? == stored,
+            "edit session definition is not in its canonical encoding"
+        );
         ensure!(
             definition.version == 2
                 && definition.bounds_revision == 1
@@ -537,6 +938,7 @@ impl Journal {
                 && session_id(&definition)? == id,
             "unsupported or changed edit session definition"
         );
+        definition.validate()?;
         ensure!(
             identity(
                 "shuttle-edit-initial-context-v2\0",
@@ -629,10 +1031,21 @@ impl Journal {
     }
 
     /// Create at most one session for the current human grant. A saved session
-    /// is returned as-is (including closure and counters), never reset.
-    pub async fn open_admitted_edit_session(
+    /// is returned as-is (including closure, counters and its context revision),
+    /// never reset or upgraded, and the provider factory is not called for it.
+    ///
+    /// A new session is context revision 2 (S034). `model_for` builds the v2
+    /// provider for one candidate definition, whose identity depends on the
+    /// candidate, so it is called once per candidate. Candidates are tried in a
+    /// fixed drop order (everything; without the plan summary; then one fewer
+    /// reference entry at a time down to none) and the first whose turn 0 composes
+    /// through the real turn-preparation function is frozen. Only a size-bound
+    /// failure moves to the next candidate; any other error is returned at once.
+    /// Nothing is written until a candidate is chosen.
+    pub async fn open_admitted_edit_session<M: ModelProvider>(
         &mut self,
         profile_digest: &str,
+        model_for: impl Fn(&AdmittedEditSession) -> Result<M>,
     ) -> Result<AdmittedEditSession> {
         ensure!(
             valid_profile_digest(profile_digest),
@@ -702,43 +1115,117 @@ impl Journal {
             "edit profile differs from admitted planning profile"
         );
         let run = self.run().await?.context("admitted run missing")?;
+        for path in &permission.allowed_paths {
+            canonical_text_patch_path(path)?;
+        }
+        let (summary, summary_truncated) = cut_utf8(&view.proposal.summary, MAX_PLAN_SUMMARY_BYTES);
         let mut initial_context = view.context;
+        // A permitted file keeps its planning preview. Any other file with a
+        // non-empty preview is an eligible reference entry; everything else is
+        // cleared exactly as revision 1 did.
+        let mut permitted = Vec::with_capacity(initial_context.files.len());
+        let mut eligible = 0usize;
         for file in &mut initial_context.files {
             let path = file
                 .path
                 .to_str()
                 .context("non-UTF-8 declared path")?
                 .replace('\\', "/");
-            if !permission.allowed_paths.contains(&path) {
+            let allowed = permission.allowed_paths.contains(&path);
+            permitted.push(allowed);
+            if allowed {
+                continue;
+            }
+            if file.utf8_preview.as_deref().is_some_and(|p| !p.is_empty()) {
+                eligible += 1;
+            } else {
                 file.utf8_preview = None;
                 file.preview_truncated = file.bytes != 0;
             }
         }
-        for path in &permission.allowed_paths {
-            canonical_text_patch_path(path)?;
+        let build = |shown: usize, with_summary: bool| -> Result<AdmittedEditSessionDefinition> {
+            let mut context = initial_context.clone();
+            let mut shown_so_far = 0usize;
+            for (file, allowed) in context.files.iter_mut().zip(&permitted) {
+                if *allowed || file.utf8_preview.is_none() {
+                    continue;
+                }
+                if shown_so_far < shown {
+                    shown_so_far += 1;
+                } else {
+                    file.utf8_preview = None;
+                    file.preview_truncated = file.bytes != 0;
+                }
+            }
+            Ok(AdmittedEditSessionDefinition {
+                version: 2,
+                bounds_revision: 1,
+                protocol: EDIT_PROTOCOL.into(),
+                run_id: run.id.clone(),
+                profile_digest: profile_digest.into(),
+                permission: permission.clone(),
+                initial_context_hash: identity("shuttle-edit-initial-context-v2\0", &context)?,
+                initial_context: context,
+                context_revision: Some(CONTEXT_REVISION_REFERENCE),
+                plan_summary: with_summary.then(|| summary.clone()),
+                plan_summary_truncated: with_summary && summary_truncated,
+                reference_omitted: Some(u32::try_from(eligible - shown)?),
+            })
+        };
+        let start = eligible.min(MAX_REFERENCE_FILES);
+        let mut candidates = Vec::new();
+        if !summary.is_empty() {
+            candidates.push((start, true));
         }
-        let definition = AdmittedEditSessionDefinition {
-            version: 2,
-            bounds_revision: 1,
-            protocol: EDIT_PROTOCOL.into(),
-            run_id: run.id,
-            profile_digest: profile_digest.into(),
-            permission,
-            initial_context_hash: identity("shuttle-edit-initial-context-v2\0", &initial_context)?,
-            initial_context,
+        candidates.extend((0..=start).rev().map(|shown| (shown, false)));
+        let candidate_for = |shown: usize, with_summary: bool| -> Result<AdmittedEditSession> {
+            let definition = build(shown, with_summary)?;
+            definition.validate()?;
+            Ok(AdmittedEditSession {
+                id: session_id(&definition)?,
+                definition,
+                attempts: 0,
+                read_count: 0,
+                read_bytes: 0,
+                reads_closed_reason: None,
+                terminal_reason: None,
+                action_id: None,
+            })
         };
-        let id = session_id(&definition)?;
-        let session = AdmittedEditSession {
-            id,
-            definition,
-            attempts: 0,
-            read_count: 0,
-            read_bytes: 0,
-            reads_closed_reason: None,
-            terminal_reason: None,
-            action_id: None,
+        // Freshness reads only what every candidate shares (the permission, the
+        // workspace root and the run), so it runs once, first: a stale binding is
+        // reported as one and not as a size failure.
+        let (first_shown, first_summary) = candidates[0];
+        self.fresh_edit_session(&candidate_for(first_shown, first_summary)?)
+            .await?;
+        let mut chosen = None;
+        let mut too_big = None;
+        for (shown, with_summary) in candidates {
+            let candidate = candidate_for(shown, with_summary)?;
+            let model = model_for(&candidate)?;
+            ensure!(
+                model.identity() == candidate.provider(),
+                "wrong v2 edit provider identity"
+            );
+            match compose_edit_intent(&candidate, 0, &[], &model) {
+                Ok(_) => {
+                    chosen = Some(candidate);
+                    break;
+                }
+                Err(error) if is_request_too_large(&error) => too_big = Some(error),
+                Err(error) => return Err(error),
+            }
+        }
+        let session = match chosen {
+            Some(session) => session,
+            None => {
+                let error = too_big.context("no edit context candidate was tried")?;
+                return Err(error.context(
+                    "initial edit context exceeds request allowance (declared-file metadata, \
+                     previews, the plan summary and the permitted path list all count toward it)",
+                ));
+            }
         };
-        self.fresh_edit_session(&session).await?;
         ensure!(
             serde_json::to_vec(&session.definition)?.len() <= 24_000,
             "initial edit context exceeds request allowance"

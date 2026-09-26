@@ -92,15 +92,15 @@ struct Worker {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-fn props(weights: &Path, build: &str) -> Value {
+fn props(weights: &Path, build: &str, n_ctx: u64) -> Value {
     json!({"build_info":build,"model_path":weights,"model_alias":"test-model",
         "chat_template":"test tool template","total_slots":1,
-        "default_generation_settings":{"n_ctx":32768,"params":{"temperature":0.8}},
+        "default_generation_settings":{"n_ctx":n_ctx,"params":{"temperature":0.8}},
         "chat_template_caps":{"supports_tools":true}})
 }
 
 impl Worker {
-    fn new(weights: PathBuf) -> Self {
+    fn with_n_ctx(weights: PathBuf, n_ctx: u64) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -131,7 +131,7 @@ impl Worker {
                     } else {
                         "test-build"
                     };
-                    Reply::json(serde_json::to_vec(&props(&weights, build)).unwrap())
+                    Reply::json(serde_json::to_vec(&props(&weights, build, n_ctx)).unwrap())
                 } else {
                     drifted = drifting.load(Ordering::SeqCst);
                     queue.lock().unwrap().pop_front().unwrap_or(Reply {
@@ -362,17 +362,25 @@ impl Harness {
     }
 
     async fn with_agents(agents: String) -> Self {
+        Self::with_setup(agents, Vec::new(), 32_768).await
+    }
+
+    /// `with_agents`, plus extra declared files under `src` and the worker's `n_ctx`.
+    async fn with_setup(agents: String, extras: Vec<(String, Vec<u8>)>, n_ctx: u64) -> Self {
         let root = tempdir().unwrap();
         let workspace = root.path().join("workspace");
         let state = root.path().join("task");
         fs::create_dir_all(workspace.join("src")).unwrap();
         fs::write(workspace.join("AGENTS.md"), agents).unwrap();
         fs::write(workspace.join("src/lib.rs"), "pub fn declared() {}\n").unwrap();
+        for (path, bytes) in &extras {
+            fs::write(workspace.join(path), bytes).unwrap();
+        }
         let executable = root.path().join("server.bin");
         let weights = root.path().join("weights.gguf");
         fs::write(&executable, b"server").unwrap();
         fs::write(&weights, b"weights").unwrap();
-        let worker = Worker::new(weights.clone());
+        let worker = Worker::with_n_ctx(weights.clone(), n_ctx);
         let profile = LlamaProfile::capture(
             worker.url.clone(),
             "test-model".into(),
@@ -419,7 +427,9 @@ impl Harness {
 
     async fn session(&self, journal: &mut Journal) -> AdmittedEditSession {
         journal
-            .open_admitted_edit_session(&self.profile.digest().unwrap())
+            .open_admitted_edit_session(&self.profile.digest().unwrap(), |candidate| {
+                LlamaModel::for_admitted_editing_v2(self.profile.clone(), candidate.id.clone())
+            })
             .await
             .unwrap()
     }
@@ -1137,7 +1147,7 @@ fn run_edit(
     let digest = h.profile.digest().unwrap();
     async move {
         workspace::run_admitted_task_edit(&h.state, "workspace", &digest, |session| {
-            LlamaModel::for_admitted_editing_v2(profile, session.id.clone())
+            LlamaModel::for_admitted_editing_v2(profile.clone(), session.id.clone())
         })
         .await
     }
@@ -1260,4 +1270,145 @@ async fn a_reply_outside_the_protocol_fails_the_turn_without_a_retry() {
     let error = run_edit(&h).await.unwrap_err().to_string();
     assert!(error.contains("fresh task state"), "{error}");
     assert_eq!(h.worker.posts().len(), 1, "no second POST");
+}
+
+// ---------------------------------------------------------------------------
+// S034: context revision 2 through the real adapter
+// ---------------------------------------------------------------------------
+
+/// A new session is context revision 2, and its first serialized request names the
+/// revision, shows the declared-but-ungranted file as a hashless reference file,
+/// carries the labelled plan note, and constrains every tool path to the granted
+/// file. Nothing is dispatched: the request is only composed.
+#[tokio::test]
+async fn a_revision_two_request_shows_reference_files_a_labelled_note_and_a_patch_path_enum() {
+    let h = Harness::new().await;
+    let mut journal = h.journal().await;
+    let session = h.session(&mut journal).await;
+    assert_eq!(session.definition.context_revision, Some(2));
+    let model = h.editor(&session);
+    let record = journal
+        .prepare_admitted_edit_turn(&session.id, &model)
+        .await
+        .unwrap();
+
+    let wire = wire(&record);
+    assert_eq!(wire["context_revision"], 2);
+    assert_eq!(
+        wire["bounds_revision"], 1,
+        "the bounds revision is unchanged"
+    );
+    assert_eq!(wire["protocol"], EDIT_PROTOCOL);
+
+    let body = post_body(&record);
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(system.contains("reference_files") && system.contains("plan_note"));
+    let user: Value =
+        serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+    assert_eq!(user["allowed_paths"], json!(["AGENTS.md"]));
+    assert_eq!(user["files"].as_array().unwrap().len(), 1);
+    let reference = user["reference_files"].as_array().unwrap();
+    assert_eq!(reference.len(), 1);
+    assert_eq!(reference[0]["path"], "src/lib.rs");
+    assert_eq!(reference[0]["preview"], "pub fn declared() {}\n");
+    assert!(reference[0].get("hash").is_none());
+    assert!(!user["plan_note"]["text"].as_str().unwrap().is_empty());
+    assert!(
+        user["plan_note"]["status"]
+            .as_str()
+            .unwrap()
+            .contains("unverified")
+    );
+
+    // Only the patch's file paths are an enum of exactly the granted paths; read
+    // and find carry none, because the worker enforces it there only sometimes.
+    assert_eq!(tool_names(&body).len(), 3);
+    for tool in body["tools"].as_array().unwrap() {
+        let name = tool["function"]["name"].as_str().unwrap();
+        let properties = &tool["function"]["parameters"]["properties"];
+        if name == "record_task_patch" {
+            assert_eq!(
+                properties["files"]["items"]["properties"]["path"]["enum"],
+                json!(["AGENTS.md"])
+            );
+        } else {
+            assert!(properties["path"].get("enum").is_none(), "{name}");
+        }
+    }
+    journal.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// S034: fit at open through the real adapter
+// ---------------------------------------------------------------------------
+
+/// The bounds a composed request must meet, measured from the saved record.
+fn assert_request_bounds(record: &RequestRecord, what: &str) {
+    let context = serde_json::to_vec(&record.intent.context).unwrap().len();
+    let post = wire(record)["exchanges"][1]["body"].as_str().unwrap().len();
+    let intent = serde_json::to_vec(&record.intent).unwrap().len();
+    assert!(context <= 24_000, "{what}: durable context {context}");
+    assert!(post <= 24_000, "{what}: POST body {post}");
+    assert!(intent <= 65_536, "{what}: request intent {intent}");
+}
+
+/// Three declared files of 1,024 hostile bytes each become reference previews.
+/// Control characters cost seven bytes each in the durable context, so the full
+/// set cannot fit and open must drop entries; backslashes and quotes cost four.
+/// Whatever open freezes, the real first turn must compose within every bound.
+#[tokio::test]
+async fn hostile_previews_never_leave_a_session_that_cannot_prepare_its_first_turn() {
+    for (name, unit) in [("control", "\u{1}"), ("backslash", "\\"), ("quote", "\"")] {
+        let extras = (0..3)
+            .map(|i| (format!("src/h{i}.rs"), unit.repeat(1_024).into_bytes()))
+            .collect();
+        let h = Harness::with_setup(agents_md(), extras, 32_768).await;
+        let mut journal = h.journal().await;
+        let session = h.session(&mut journal).await;
+        let model = h.editor(&session);
+        let record = journal
+            .prepare_admitted_edit_turn(&session.id, &model)
+            .await
+            .unwrap_or_else(|error| panic!("{name}: the first turn must compose: {error:#}"));
+        assert_request_bounds(&record, name);
+        session.definition.validate().unwrap();
+        let shown = session.definition.reference_files().unwrap().len();
+        let omitted = session.definition.reference_omitted.unwrap();
+        assert_eq!(shown + usize::try_from(omitted).unwrap(), 3, "{name}");
+        if name == "control" {
+            assert!(
+                shown < 3 || session.definition.plan_summary.is_none(),
+                "control characters must force something to be dropped"
+            );
+        }
+        journal.close().await;
+    }
+}
+
+/// A worker whose context window cannot hold even the smallest turn-0 request
+/// fails every candidate on the conservative `n_ctx` check. Open must classify that
+/// as a size failure, refuse, and save nothing.
+#[tokio::test]
+async fn a_worker_context_too_small_for_turn_zero_refuses_open_as_a_size_failure() {
+    let h = Harness::with_setup(agents_md(), Vec::new(), 8_192).await;
+    let mut journal = h.journal().await;
+    let requests_before = journal.model_requests().await.unwrap().len();
+    let error = journal
+        .open_admitted_edit_session(&h.profile.digest().unwrap(), |candidate| {
+            LlamaModel::for_admitted_editing_v2(h.profile.clone(), candidate.id.clone())
+        })
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(
+        cortex_shuttle::edit_session::is_request_too_large(&error),
+        "{message}"
+    );
+    assert!(message.contains("request exceeds conservative context allowance"));
+    assert!(message.contains("initial edit context exceeds request allowance"));
+    assert_eq!(
+        journal.model_requests().await.unwrap().len(),
+        requests_before
+    );
+    journal.close().await;
 }

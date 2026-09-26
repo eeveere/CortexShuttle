@@ -194,7 +194,10 @@ impl Harness {
     }
 
     async fn open_session(&self, journal: &mut Journal) -> AdmittedEditSession {
-        journal.open_admitted_edit_session(DIGEST).await.unwrap()
+        journal
+            .open_admitted_edit_session(DIGEST, |_| Ok(Editor::new()))
+            .await
+            .unwrap()
     }
 }
 
@@ -1173,6 +1176,429 @@ async fn a_linked_workspace_root_is_refused() {
             .unwrap()
             .is_empty(),
         "no observation may be stored"
+    );
+    journal.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// S034: context revision 2, reference files and fit at open
+// ---------------------------------------------------------------------------
+
+/// A provider whose composed POST body has a length chosen by the test from the
+/// candidate definition it is asked about, so each drop step can be made to fit
+/// or not. The context itself stays far below its own bound.
+struct Bulky {
+    identity: String,
+    size: fn(&AdmittedEditTurnContext) -> usize,
+}
+
+impl Bulky {
+    fn new(size: fn(&AdmittedEditTurnContext) -> usize) -> Self {
+        Self {
+            identity: format!("{EDIT_PROTOCOL}:{DIGEST}"),
+            size,
+        }
+    }
+}
+
+#[async_trait]
+impl ModelProvider for Bulky {
+    fn identity(&self) -> &str {
+        &self.identity
+    }
+    fn prepare_request(&self, context: &ModelContext) -> Result<Option<serde_json::Value>> {
+        let (turn, _) = parse_edit_model_context(context)?;
+        Ok(Some(serde_json::json!({
+            "protocol": EDIT_PROTOCOL,
+            "exchanges": [{"method": "POST", "body": "x".repeat((self.size)(&turn))}]
+        })))
+    }
+    async fn respond(&mut self, _: &ModelContext) -> Result<Decision> {
+        unreachable!("tests never dispatch")
+    }
+}
+
+/// Eleven eligible reference entries: `src/other.rs` and ten tiny extras, all with
+/// non-empty previews, next to the granted `src/main.rs`.
+async fn harness_with_many_references() -> Harness {
+    let extras: Vec<(String, Vec<u8>)> = (0..10)
+        .map(|i| {
+            (
+                format!("src/ref{i:02}.rs"),
+                format!("// reference {i}\n").into_bytes(),
+            )
+        })
+        .collect();
+    let borrowed: Vec<(&str, &[u8])> = extras
+        .iter()
+        .map(|(path, bytes)| (path.as_str(), bytes.as_slice()))
+        .collect();
+    Harness::with_files(&["src/main.rs"], &borrowed).await
+}
+
+fn reference_paths(session: &AdmittedEditSession) -> Vec<String> {
+    session
+        .definition
+        .reference_files()
+        .unwrap()
+        .into_iter()
+        .map(|file| file.path.to_string_lossy().replace('\\', "/"))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_new_session_is_context_revision_two_with_reference_previews_and_a_summary() {
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    let definition = &session.definition;
+    assert_eq!(definition.context_revision, Some(2));
+    assert_eq!(definition.bounds_revision, 1);
+    assert_eq!(definition.reference_omitted, Some(0));
+    assert_eq!(
+        definition.plan_summary.as_deref(),
+        Some("Propose a bounded source edit for separate permission.")
+    );
+    assert!(!definition.plan_summary_truncated);
+    // The permitted file keeps its planning preview and is never a reference file.
+    assert_eq!(reference_paths(&session), ["src/other.rs"]);
+    let files = &definition.initial_context.files;
+    let by_path = |name: &str| {
+        files
+            .iter()
+            .find(|f| f.path.to_string_lossy().replace('\\', "/") == name)
+            .unwrap()
+    };
+    assert!(by_path("src/main.rs").utf8_preview.is_some());
+    assert!(by_path("src/other.rs").utf8_preview.is_some());
+    // A file with no usable preview is cleared exactly as revision 1 cleared it.
+    assert!(by_path("src/blob.rs").utf8_preview.is_none());
+    assert!(by_path("src/blob.rs").preview_truncated);
+    definition.validate().unwrap();
+    // The saved definition reloads with the same identity.
+    let reloaded = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert_eq!(reloaded.definition, session.definition);
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn reference_entries_are_capped_at_eight_and_the_rest_are_cleared() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    // Path order: other, then ref00..ref06 are the first eight eligible files.
+    assert_eq!(
+        reference_paths(&session),
+        [
+            "src/other.rs",
+            "src/ref00.rs",
+            "src/ref01.rs",
+            "src/ref02.rs",
+            "src/ref03.rs",
+            "src/ref04.rs",
+            "src/ref05.rs",
+            "src/ref06.rs"
+        ]
+    );
+    assert_eq!(session.definition.reference_omitted, Some(3));
+    for name in ["src/ref07.rs", "src/ref08.rs", "src/ref09.rs"] {
+        let file = session
+            .definition
+            .initial_context
+            .files
+            .iter()
+            .find(|f| f.path.to_string_lossy().replace('\\', "/") == name)
+            .unwrap();
+        assert!(file.utf8_preview.is_none(), "{name} must be cleared");
+        assert!(file.preview_truncated);
+    }
+    session.definition.validate().unwrap();
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn open_drops_the_summary_then_entries_until_turn_zero_composes() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    // 22,000 + 400 per shown entry + 600 with a summary, against the 24,000 POST
+    // bound: (8 entries + summary) 25,800, (8) 25,200, (7) 24,800, (6) 24,400 all
+    // fail, and (5) 24,000 fits exactly.
+    let sizes = std::cell::RefCell::new(Vec::new());
+    let session = journal
+        .open_admitted_edit_session(DIGEST, |candidate| {
+            sizes
+                .borrow_mut()
+                .push(serde_json::to_vec(&candidate.definition).unwrap().len());
+            Ok(Bulky::new(|turn| {
+                22_000
+                    + 400 * turn.session.reference_files().unwrap().len()
+                    + if turn.session.plan_summary.is_some() {
+                        600
+                    } else {
+                        0
+                    }
+            }))
+        })
+        .await
+        .unwrap();
+    assert_eq!(reference_paths(&session).len(), 5);
+    assert!(session.definition.plan_summary.is_none());
+    assert!(!session.definition.plan_summary_truncated);
+    assert_eq!(session.definition.reference_omitted, Some(6));
+    let sizes = sizes.into_inner();
+    assert_eq!(sizes.len(), 5, "one factory call per candidate tried");
+    assert!(
+        sizes.windows(2).all(|pair| pair[1] < pair[0]),
+        "every drop step must make the definition smaller: {sizes:?}"
+    );
+    // The objective and constraints are never shortened.
+    assert_eq!(
+        session.definition.initial_context.objective,
+        "Edit one declared source file."
+    );
+    assert_eq!(
+        session.definition.initial_context.constraints,
+        ["Keep verification declared."]
+    );
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn a_refused_open_writes_nothing_and_leaves_the_permission_usable() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    let requests_before = journal.model_requests().await.unwrap().len();
+    let calls = std::cell::Cell::new(0usize);
+    let error = journal
+        .open_admitted_edit_session(DIGEST, |_| {
+            calls.set(calls.get() + 1);
+            Ok(Bulky::new(|_| 30_000))
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("initial edit context exceeds request allowance"),
+        "got: {error:#}"
+    );
+    // One full candidate, then nine entry counts from eight down to none.
+    assert_eq!(calls.get(), 10);
+    // Nothing was written: no request was reserved, and a provider that fits opens
+    // the session afterwards with the full candidate (a buggy open that had saved
+    // the last, smallest candidate before failing would return that one instead).
+    assert_eq!(
+        journal.model_requests().await.unwrap().len(),
+        requests_before
+    );
+    let session = harness.open_session(&mut journal).await;
+    assert_eq!(session.attempts, 0);
+    assert!(session.terminal_reason.is_none());
+    assert_eq!(reference_paths(&session).len(), 8);
+    assert!(session.definition.plan_summary.is_some());
+    assert_eq!(session.definition.reference_omitted, Some(3));
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn only_size_failures_move_to_the_next_candidate() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+
+    let calls = std::cell::Cell::new(0usize);
+    let error = journal
+        .open_admitted_edit_session(DIGEST, |_| -> Result<Editor> {
+            calls.set(calls.get() + 1);
+            anyhow::bail!("worker profile mismatch")
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("worker profile mismatch"));
+    assert_eq!(
+        calls.get(),
+        1,
+        "a factory error must not try other candidates"
+    );
+
+    let calls = std::cell::Cell::new(0usize);
+    let error = journal
+        .open_admitted_edit_session(DIGEST, |_| {
+            calls.set(calls.get() + 1);
+            let mut wrong = Editor::new();
+            wrong.0 = format!("{EDIT_PROTOCOL}:{}", "b".repeat(64));
+            Ok(wrong)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("wrong v2 edit provider identity")
+    );
+    assert_eq!(
+        calls.get(),
+        1,
+        "an identity mismatch must not try other candidates"
+    );
+
+    struct Broken;
+    #[async_trait]
+    impl ModelProvider for Broken {
+        fn identity(&self) -> &str {
+            "shuttle-llama-admitted-editing-v2:a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4"
+        }
+        fn prepare_request(&self, _: &ModelContext) -> Result<Option<serde_json::Value>> {
+            anyhow::bail!("edit session profile differs from this worker profile")
+        }
+        async fn respond(&mut self, _: &ModelContext) -> Result<Decision> {
+            unreachable!()
+        }
+    }
+    let calls = std::cell::Cell::new(0usize);
+    let error = journal
+        .open_admitted_edit_session(DIGEST, |_| {
+            calls.set(calls.get() + 1);
+            Ok(Broken)
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("differs from this worker profile")
+    );
+    assert_eq!(
+        calls.get(),
+        1,
+        "a non-size composition error must not try other candidates"
+    );
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn a_saved_session_is_returned_unchanged_without_calling_the_factory() {
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let first = harness.open_session(&mut journal).await;
+    let again = journal
+        .open_admitted_edit_session(DIGEST, |_| -> Result<Editor> {
+            panic!("the factory must not be called for a saved session")
+        })
+        .await
+        .unwrap();
+    assert_eq!(again.id, first.id);
+    assert_eq!(again.definition, first.definition);
+    journal.close().await;
+}
+
+#[tokio::test]
+async fn reading_a_reference_path_is_rejected_and_closes_the_session() {
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    assert_eq!(reference_paths(&session), ["src/other.rs"]);
+    let error = read_turn(
+        &mut journal,
+        &session,
+        TextReadOperation::FindTaskText {
+            path: "src/other.rs".into(),
+            literal: "untouched".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("outside the write permission"),
+        "got: {error:#}"
+    );
+    // The rejection is fail-closed: it closes the session and pauses the run,
+    // which is why revision 2 constrains tool paths to the permitted set.
+    let closed = journal.admitted_edit_session(&session.id).await.unwrap();
+    assert!(closed.terminal_reason.is_some());
+    assert_eq!(journal.run().await.unwrap().unwrap().phase, "paused");
+    assert!(
+        journal
+            .admitted_read_history(&session.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    journal.close().await;
+}
+
+/// A stale binding is reported as one, before any candidate is composed. With the
+/// run paused and a provider that never fits, the freshness error must win and
+/// the factory must not be called at all.
+#[tokio::test]
+async fn a_stale_binding_is_reported_before_any_candidate_is_composed() {
+    let harness = harness_with_many_references().await;
+    let mut journal = harness.journal().await;
+    journal.pause("held for the test").await.unwrap();
+    let calls = std::cell::Cell::new(0usize);
+    let error = journal
+        .open_admitted_edit_session(DIGEST, |_| {
+            calls.set(calls.get() + 1);
+            Ok(Bulky::new(|_| 30_000))
+        })
+        .await
+        .unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains("run is not ready"), "got: {message}");
+    assert!(!message.contains("request allowance"), "got: {message}");
+    assert_eq!(
+        calls.get(),
+        0,
+        "no candidate may be built for a stale binding"
+    );
+    journal.close().await;
+}
+
+/// The stored definition must be in its canonical encoding. The table forbids
+/// updating it, so the test drops that trigger to plant a second encoding of the
+/// same content (an explicit false flag); the loader must refuse it, because it
+/// would otherwise load under the same identity.
+#[tokio::test]
+async fn a_second_encoding_of_a_stored_definition_is_refused_at_load() {
+    use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+
+    let harness = Harness::new(&["src/main.rs"]).await;
+    let mut journal = harness.journal().await;
+    let session = harness.open_session(&mut journal).await;
+    journal.close().await;
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().filename(harness.state.join("journal.sqlite")))
+        .await
+        .unwrap();
+    let stored: Vec<u8> =
+        sqlx::query_scalar("SELECT definition_json FROM admitted_edit_sessions WHERE id = ?")
+            .bind(&session.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut text = String::from_utf8(stored).unwrap();
+    assert!(text.ends_with('}') && !text.contains("\"plan_summary_truncated\""));
+    text.pop();
+    text.push_str(",\"plan_summary_truncated\":false}");
+    sqlx::query("DROP TRIGGER immutable_edit_session")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE admitted_edit_sessions SET definition_json = ? WHERE id = ?")
+        .bind(text.into_bytes())
+        .bind(&session.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let journal = harness.journal().await;
+    let error = journal
+        .admitted_edit_session(&session.id)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("canonical encoding"),
+        "got: {error:#}"
     );
     journal.close().await;
 }

@@ -1318,8 +1318,8 @@ pub async fn load_admission(
 
 // The serialized request also includes JSON escaping, the tool schema and the
 // fixed prompt. Keep source previews well below the transport's 24 KiB bound.
-const TASK_CONTEXT_PREVIEW_BYTES: usize = 4 * 1024;
-const TASK_CONTEXT_FILE_PREVIEW_BYTES: usize = 1024;
+pub(crate) const TASK_CONTEXT_PREVIEW_BYTES: usize = 4 * 1024;
+pub(crate) const TASK_CONTEXT_FILE_PREVIEW_BYTES: usize = 1024;
 
 fn bounded_utf8_preview(bytes: &[u8], limit: usize) -> Option<String> {
     let text = std::str::from_utf8(bytes).ok()?;
@@ -2376,15 +2376,16 @@ pub fn plan_workspace_text_patch(
 /// state. A successful patch changes the admitted snapshot, so re-admission,
 /// verification, review and an explicit decision remain separate later steps.
 ///
-/// `model_for` builds the provider for the session this call opens; its
-/// identity must be the session's provider. v1 whole-file edit requests are no
+/// `model_for` builds the provider for a session definition: open calls it once
+/// per candidate definition of a new session (S034), and this call once more for
+/// the session it runs. Its identity must be the session's provider. v1 whole-file edit requests are no
 /// longer generated: legacy records stay readable, and a run holding any of
 /// them cannot open a v2 session.
 pub async fn run_admitted_task_edit<M: ModelProvider>(
     state_dir: &Path,
     workspace_id: &str,
     profile_digest: &str,
-    model_for: impl FnOnce(&AdmittedEditSession) -> Result<M>,
+    model_for: impl Fn(&AdmittedEditSession) -> Result<M>,
 ) -> Result<ActionRecord> {
     let mut journal = Journal::open(&state_dir.join("journal.sqlite")).await?;
     let result = async {
@@ -2400,7 +2401,9 @@ pub async fn run_admitted_task_edit<M: ModelProvider>(
             )
             .await?;
         bind_admission_run_for_planning(&journal, &view.admission, &run.id).await?;
-        let session = journal.open_admitted_edit_session(profile_digest).await?;
+        let session = journal
+            .open_admitted_edit_session(profile_digest, &model_for)
+            .await?;
         if let Some(action_id) = &session.action_id {
             // Resume a prepared action once, or return a saved success.
             return journal.apply_admitted_text_patch(action_id).await;

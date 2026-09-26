@@ -257,7 +257,10 @@ fn patch_reply(files: Vec<WorkspaceFilePatch>) -> RequestResult {
 }
 
 async fn session(journal: &mut Journal) -> AdmittedEditSession {
-    journal.open_admitted_edit_session(DIGEST).await.unwrap()
+    journal
+        .open_admitted_edit_session(DIGEST, |_| Ok(Editor::new()))
+        .await
+        .unwrap()
 }
 
 /// Reserve and start one turn; the reply is not committed.

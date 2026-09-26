@@ -1239,8 +1239,24 @@ list.
   `.shuttle/k3fix2-windows.log` and `.shuttle/k3fix2-docker.log`.
 - S034 (admitted edit context sufficiency: read-only reference files, a
   labelled plan summary and a revision-2 context) was drafted, independently
-  reviewed twice and accepted by the operator on 2026-09-26. Implementation
-  (K5b-K5d) has not started; see S034 in `docs/decisions.md`.
+  reviewed twice and accepted by the operator on 2026-09-26. K5b is
+  implemented: context revision 2 (reference files, a labelled plan summary and a
+  revision-specific prompt with a permitted-path `enum` on every tool path), the
+  fit-at-open candidate loop through a provider factory, the canonical-encoding
+  check at load, and a synthetic revision-1 golden that pins the old bytes.
+  Windows 299 and Docker Linux 300 tests pass (none failed, 10 ignored on each)
+  with formatting and warnings-denied Clippy clean. An independent review found no
+  limit raised, no authority widened and no stored revision-1 identity changed,
+  and its fixes are applied. The live probe (operator-authorized, standalone
+  requests, nothing journaled) found the path `enum` accepted in every schema but
+  enforced unreliably for read and find (5 of 10 explicit attempts) and reliably for
+  the patch tool (4 of 4), with 3 of about 27 enum requests running to the token
+  limit with no tool call. The operator chose to keep the `enum` on the patch tool
+  only, and K5b ships it there (a recorded amendment of S034 Decision 3).
+  Not done: K5c (review and offer surfaces), K5d, and an end-to-end revision-1
+  session golden from a pre-change harness. The size classifications for the
+  adapter POST limit and the request intent are typed but untested at open. See
+  the implementation clarifications at the end of S034.
 - K4 (2026-09-26): emCP verification plan v2 written and validated by a scratch
   intake and preflight, with no emCP file touched. It replaces the known-broken
   plan file and plan `e`, which named `C:\dev\agentic\emCP` (no longer present),

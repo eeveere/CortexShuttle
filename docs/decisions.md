@@ -1218,10 +1218,11 @@ the obligations above before the capability is advertised or qualified live.
 
 ## S034 — Show admitted edit sessions read-only reference context
 
-2026-09-26. **Accepted design; implementation not started.** The operator
-accepted it in chat on 2026-09-26, after two independent reviews and a revision
-the same day (see the review record). No code, stored byte, bound or profile
-changes with this text. It
+2026-09-26. **Accepted design; K5b implemented, K5c and K5d pending.** The
+operator accepted it in chat on 2026-09-26, after two independent reviews and a
+revision the same day (see the review record). The design text below is frozen;
+the implementation clarifications at the end record what K5b settled and one
+operator amendment of Decision 3 (the path `enum` is on the patch tool only). It
 is the separately scoped increment that S033's closure clarification (2026-09-25)
 left open. It adds no tool, no permission and no read or write authority, and it
 raises no S033 limit; it does add two new restrictive caps and restates two
@@ -1642,3 +1643,128 @@ without a third independent review of them. Acceptance approves the design and
 authorizes K5b onward; it starts no implementation, changes no code or stored
 byte, and does not satisfy K5d's independent review of the implementation, K4, or
 K6's live run.
+
+### Implementation clarifications (K5b, 2026-09-26)
+
+K5b is implemented and gated: Windows 299 passed and Docker Linux 300 passed,
+with none failed and 10 ignored on each, and formatting and warnings-denied
+Clippy pass on both. An independent Opus : high review (fresh session, read-only)
+found no path that raises a limit, widens read or write authority, or changes a
+stored revision-1 identity, and its fixes are applied. The implementation settled
+these points that the text above left open or states differently:
+
+- **`n_ctx` is a size failure.** Decision 5 names the context, POST and intent
+  bounds. The adapter's conservative `body + max_tokens + 4096 <= n_ctx` check is
+  typed the same way, so a worker window too small for the smallest turn 0 refuses
+  the open instead of erroring on the first candidate.
+- **`validate` applies the preview caps to both revisions.** The per-file (1,024)
+  and total (4,096) caps are checked for revision 1 too. Preview capture and the
+  clearing of non-permitted previews at open have not changed since the initial
+  import, so no genuine revision-1 definition can fail them.
+- **Canonical encoding at load.** The loader requires the stored definition bytes to
+  equal a re-serialization of the parsed definition. The identity is recomputed
+  from the re-serialized struct, so an explicit `null` or `false` field would
+  otherwise load as a second encoding under the same identity. The table's update
+  trigger already forbids changing a stored definition; this refuses a planted row.
+- **Order at open.** Freshness is checked once, first, because every candidate
+  shares the permission, the workspace root and the run. A stale binding is
+  reported as one, and the provider factory is not called for it.
+- **Amendment of Decision 3 (operator, 2026-09-26): the path `enum` is on the patch
+  tool only.** Decision 3 as frozen above puts an `enum` of exactly `allowed_paths`
+  on `read_task_text`, `find_task_text` and the patch's file entries. After the
+  live probe below, the operator chose to keep it only on the patch tool's
+  `files[].path`, where this worker enforced it in 4 of 4 attempts. Read and find
+  carry no `enum`: it was enforced there only sometimes and was associated with
+  runs that hit the token limit without a tool call. A read or find path outside
+  the permission is still rejected by the journal, which closes the session, so that
+  risk is reduced by the prompt and by the model's observed behaviour and not
+  removed. Wherever the text above says every path is constrained, read it as the
+  patch tool's paths.
+- **The path enum still has a cost.** `allowed_paths` now appears in the prompt and
+  in the patch schema, two copies in the POST body. A grant of many long paths (up
+  to 32, each up to 1,024 bytes) can fail every candidate where revision 1 would
+  have opened. That fails closed with the size message (which now says the
+  permitted path list counts), and new sessions have no revision-1 fallback. It is
+  untested with a long-path grant.
+- **Error text.** The request-intent bound keeps the exact message revision-1
+  sessions wrote into their closure reasons.
+
+What the tests pin, and what they do not:
+
+- **Pinned.**
+  - Revision 1: a synthetic golden definition whose identity and
+    `initial_context_hash` were computed before context revision 2 existed, and
+    its byte-identical round trip. The revision-1 system prompt is pinned against
+    the text in `HEAD` before this change, and the revision-1 prompt and the three
+    tool schemas are pinned from the current code, which is unchanged for revision
+    1 by construction and by two independent reads.
+  - Definition rules: the `validate` matrix, the UTF-8 cut, the always-serialized
+    omission count, and the fail-closed downgrade.
+  - Open: drop order (the summary first, then entries, with every step shrinking
+    the definition), that only size failures move on, that a refused open writes
+    and reserves nothing, the freshness order, and the canonical-encoding check.
+  - Fit: hostile control-character, backslash and quote previews always leave a
+    first turn that composes within the context, POST and intent bounds (control
+    characters force a drop), and a small `n_ctx` refuses open as a typed size
+    failure.
+  - Authority: a reference path in a read, find or patch is rejected and closes the
+    session. The revision-2 request names its context revision, shows hashless
+    reference files and the labelled note, and constrains the patch's file paths
+    to the permitted set. Nothing is added on a patch-only turn.
+- **Mutation checks caught** (each guard reverted, the tests failed): non-size
+  errors returning at once, the drop order, the path enum, revision-1
+  serialization, a hash on reference files, the context and edit-POST and `n_ctx`
+  size classifications, the freshness order, and the canonical-encoding check.
+- **Known gaps.**
+  - The adapter's POST-limit and the request-intent size classifications are typed
+    but no test reaches them at open, because hostile previews hit the
+    durable-context bound first. A wrong classification there would refuse the open
+    with the size message instead of trying a smaller candidate.
+  - No revision-1 session is loaded into a journal and prepared through the real
+    adapter. Revision-1 wire bytes are protected by the projection pins and by code
+    reading, not by an end-to-end golden from a pre-change harness.
+  - Whether llama.cpp enforces the path `enum` was tested live (below), and the
+    answer is "not reliably". It fails closed either way, since the journal rejects
+    a path outside the permission.
+  - K5c is not built: `task-edit-review`, the terminal task view and the offer
+    review do not yet show the context revision, reference files, omissions or
+    summary state (Decision 6).
+
+### Live enum probe (2026-09-26, operator-authorized)
+
+Standalone requests to the operator's worker (build `b10278-d52ec04a6`, Qwen3.5-4B
+Q4_K_M, `n_ctx` 65,280), sent outside Shuttle's journal with the saved profile's
+sampling settings (`seed` 42, temperature 0, thinking off, 512 tokens) and the real
+revision-2 system prompt and tool schemas. Nothing was written to any journal or to
+the repository, and the worker was not started or reconfigured. About 40 requests
+in six scripts; the results below are counts of what happened, on a small sample.
+
+- **Acceptance.** The worker accepted every schema, including a realistic 32-path
+  enum (a 22,568-byte request). The grammar-expansion HTTP 400 that the `maxItems`
+  keyword caused in attempt 06 did not recur.
+- **Read and find: enforced unreliably.** With an explicit instruction to use a path
+  outside the enum, `read_task_text` and `find_task_text` with the shipped enum kept
+  the forbidden path in 5 of 10 attempts that produced a call and honoured the enum
+  in 5. The identical request gave both outcomes within one sequence, and one
+  attempt ran to 512 tokens with no tool call. The `enum`-without-`type`, `const`
+  and `pattern` formulations each kept the forbidden path when tried once, and the
+  integer bounds made no difference, so no formulation of the top-level path was
+  found that is enforced reliably.
+- **Patch: enforced.** The nested `record_task_patch` `files[].path` enum forced the
+  path into the enum in 4 of 4 explicit attempts, including a two-file patch and a
+  second forbidden path.
+- **Unprompted behaviour.** In 10 tempting scenarios that did not name a forbidden
+  path (reference file visible, objective mentioning it), the model never named
+  one, with or without the enum.
+- **A cost.** 3 of about 27 enum-bearing requests ended at 512 tokens with no tool
+  call (the model reasoned in its `content` channel that the requested file is not
+  allowed); none of 13 requests without the enum did. A length completion fails the
+  turn and closes the session (S033). The sample is small and the two identical
+  reruns of one of these were not independent.
+
+What this means for Decision 3. The journal still rejects any path outside the
+permission and closes the session, so the enum reduces the chance of that and cannot
+remove it, exactly as the fail-closed clause of Decision 3 anticipated. On this
+worker it is reliable only for the patch tool and may add a length-overrun risk on
+read and find. The operator chose to keep it on the patch tool only, and K5b now
+ships it there (see the amendment above).
