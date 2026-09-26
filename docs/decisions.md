@@ -1215,3 +1215,423 @@ overlapping-match premise and bound arithmetic were checked. No production code,
 worker settings or live task state changed. Runtime tests were not run because
 this chunk implements no runtime behavior. Later chunks must implement and test
 the obligations above before the capability is advertised or qualified live.
+
+## S034 — Show admitted edit sessions read-only reference context
+
+2026-09-26. **Proposed design, revised after an independent review the same day;
+not accepted.** No code, stored byte, bound or profile changes with this text. It
+is the separately scoped increment that S033's closure clarification (2026-09-25)
+left open. It adds no tool, no permission and no read or write authority, and it
+raises no S033 limit; it does add two new restrictive caps and restates two
+inherited ones, listed in the bounds delta below. S033's protocol, hunks, bounds, permission, review and finalization
+contracts, and S028–S032's human authority, stay in force, except the two S033
+sentences this decision amends for the new context revision only (see
+"Amendments").
+
+### Problem
+
+The live Chunk 7 run (attempt 7g, emCP) produced a wrong patch, and the final
+evidence review put it down to the edit context and the model's read strategy. The
+saved journal supports the first cause specifically:
+
+- The plan declared two files, `AGENTS.md` (11,643 bytes) and `package.json`
+  (1,395 bytes). The planning context captured a 1,024-byte preview of each. The
+  `package.json` preview contains the whole `scripts` block, with no `test:mcp`.
+- Opening an edit session copies the planning context but clears the preview of
+  every file that is not a permitted path (`src/edit_session.rs:712-715`) before
+  the definition is frozen and hashed. The model-facing projection then lists only
+  allowed files (`v2_prompt`, `src/llama.rs:141`). So the edit model never saw
+  `package.json`, whose scripts would have contradicted the `npm run test:mcp` it
+  invented.
+- The planning summary is not carried into editing at all.
+- The three reads covered `AGENTS.md` bytes 0-6,087. The guidance the objective
+  targets is at bytes 8,108-8,290 and 11,531-11,643. (The qualification record notes
+  these offsets were taken from the journal's file, not read from emCP.)
+  `find_task_text` was offered on all three read turns and never used. The system
+  prompt does not say to search first.
+
+Whether the 4B worker can do the task with enough context is not established. The
+edit POST bodies of attempts 7 and 7g are identical for request 1 (the request
+intents differ only in session IDs), so "twice" is one sample.
+
+### Measured headroom (7g, read-only from the retained journal)
+
+Sizes are UTF-8 bytes, the unit the code checks (`serde_json::to_vec` and
+`body.len()`), recomputed from `model_requests` with `mode=ro&immutable=1`:
+
+| Request | Durable context | POST body | Request intent |
+| --- | --- | --- | --- |
+| edit turn 0 (`request/1`) | 3,936 | 4,896 | 12,368 |
+| after 1 read | 7,251 | 7,871 | 18,912 |
+| after 2 reads | 10,549 | 10,828 | 25,397 |
+| after 3 reads, patch turn | 13,877 | 12,971 | 30,994 |
+| Limit | 24,000 | 24,000 | 65,536 |
+
+The worker's `n_ctx` is 65,280, so the 24,000-byte context and POST bounds bind, not
+`n_ctx`. A 2,048-byte read added about 3.3 KB of durable context and about 3.0 KB
+of POST in 7g; the last POST step is smaller (2.1 KB) because the patch-only turn
+drops two tool schemas. The total read budget is 6,144 bytes, which is exactly three
+2,048-byte reads, and 7g spent it all, so its patch turn was patch-only because the
+byte budget was gone. A fourth read is possible only with shorter excerpts.
+
+With ordinary prose the 7g patch turn used 13,877 of 24,000 context bytes, leaving
+about 10 KB. Ordinary text is not the binding case. Escaping is. Text is encoded at
+several levels: the definition and each observation are JSON inside a string
+inside the durable context, and the POST body is a string inside the request
+intent. A backslash costs four bytes in the durable context and a control character
+seven. So 6,144 bytes of backslashes reach about 24.6 KB of context by themselves.
+A control character costs 7 bytes in the POST body too, and 9 once that body is
+stored inside the request intent, about 16 per byte in the intent. For preview
+control characters the 24,000-byte context and POST bounds therefore bind first, at
+about 3,430 preview bytes (24,000 / 7), long before the intent reaches 4,096 x 16 =
+65,536. These worst cases are why the fit rule below must be exact and tested with
+hostile text.
+
+### Decisions
+
+1. **Keep non-permitted previews (reference files).** A context-revision-2 session
+   definition retains the planning context's previews for a bounded set of
+   declared files that are not permitted paths. They are already captured, already
+   bounded (1,024 bytes per file and 4,096 in total, in snapshot order) and already
+   part of the planning context, so no source file is opened and no new bytes are
+   created. The provider sees them in a separate `reference_files` array, distinct
+   from `files`.
+   - **Eligible and shown.** An eligible entry is a non-permitted file whose
+     preview is present and non-empty (once the 4,096-byte pool is spent, later
+     files get an empty preview and are not eligible). At most 8 eligible entries
+     are shown, in snapshot order. The 4,096-byte preview total is inherited.
+   - **Fields.** Each entry has `path`, `kind`, `bytes`, `preview` and
+     `preview_truncated`. It has no hash: a hash invites a patch on a path that
+     cannot be patched, and that would be a domain rejection that closes the
+     session. Reference files are read-only data: the system prompt says they
+     cannot be read with the tools or changed, `read_task_text` and
+     `find_task_text` stay limited to `allowed_paths`, and a patch may touch only
+     permitted files.
+   - **Frozen definition.** Shown entries keep their previews. Every other
+     non-permitted file has its preview cleared exactly as in revision 1
+     (`utf8_preview = None`, `preview_truncated = bytes != 0`), so the durable
+     budget is not spent on text the model never sees. Permitted files are unchanged.
+   - **Omission.** `reference_omitted` is the count of eligible entries not shown,
+     because of the 8-entry cap or the fit rule. It is a count and not a list of
+     paths, and revision 2 always serializes it, even when it is 0. Then dropping an
+     entry always makes the definition smaller: the count keeps its width, whereas a
+     count skipped when zero would let the first drop of a one-byte preview grow the
+     single-encoded definition by two bytes (the same mistake S033's `reads_closed`
+     clarification records and avoids). The property is stated for the frozen
+     definition and for the composed durable context, POST and intent.
+2. **Carry a bounded, labelled plan summary.** The definition freezes the planning
+   proposal's `summary` (available at open through the saved permission view, which
+   binds the proposal request), cut at a UTF-8 boundary to 1,024 bytes with a
+   `plan_summary_truncated` flag. The planning decoder already caps it at 4,096
+   bytes. Limitations and proposed paths are not carried. The projection labels it
+   an unverified, model-written note that the task text and files override.
+   - **Where the new fields live.** All of them sit at the top level of
+     `AdmittedEditSessionDefinition` (`context_revision`, `plan_summary`,
+     `plan_summary_truncated`, `reference_omitted`), and none inside
+     `AdmittedTaskContext`, which planning shares and hashes
+     (`AdmittedTaskContext::id`, `src/workspace.rs:101`).
+   - **Absence means dropped.** In revision 2 an absent summary means the fit rule
+     dropped it. The planning decoder guarantees a non-empty summary
+     (`src/llama/stream.rs:203`), so absence is unambiguous and no separate marker
+     is stored (a `dropped` marker would make the smaller candidate larger). Review
+     reports the state as included, cut (the flag) or dropped (absent).
+   Attempt 7's plan wrongly said `test:live` "runs the MCP stdio end-to-end test",
+   so the label is part of the decision.
+3. **Revision-specific system prompt.** Context revision 2 has its own system
+   prompt, and revision 1 keeps its existing one unchanged. It adds that
+   `find_task_text` is the cheaper way to reach text beyond the previews, that
+   reference files are read-only and cannot be changed, and that new text must not
+   introduce commands, scripts or paths that do not appear in text the model has
+   seen. It is guidance and not a filter: Shuttle adds no semantic check of command
+   names.
+   - **Tool schemas constrain the path.** Revision-2 tool schemas set `path` to an
+     `enum` of exactly `allowed_paths` for `read_task_text`, `find_task_text` and
+     the patch's file entries; revision-1 schemas are unchanged. A read, find or
+     patch path outside the permission is rejected by the journal, and that
+     rejection closes the session (`src/edit_session.rs:924-928`, through
+     `commit_edit_turn_failure`, about `:1029-1042`). This design shows reference
+     paths, and its guidance points the model at `find_task_text`, so without the
+     enum a model could search `package.json` and forfeit the permission. Whether
+     llama.cpp's grammar enforces an `enum` is not established and must be tested
+     (K5b). If it does not, the schema still documents the rule and the journal
+     still rejects the path, so an attempted reference read or patch still closes
+     the session. That is fail-closed and widens nothing. The enum repeats
+     `allowed_paths` in up to three schemas, so the fit rule counts it.
+   - **Turn invariance.** The revision-2 system prompt and projection are identical
+     on every turn except the fields revision 1 already varies (the budget block
+     and the offered tools), and nothing is added on a patch-only turn. That
+     preserves S033's Chunk 4a argument (item 5) that the turn after a refused
+     read is never larger than the refused turn.
+4. **A separate context revision; `bounds_revision` stays 1.** The bounds table is
+   unchanged, so the bounds revision does not change. The definition gains an
+   optional `context_revision`, and the wire carries `"context_revision": 2` only
+   for revision 2. This keeps everything that pins `bounds_revision == 1`
+   untouched: the loader, observations and history parsing, the wire's checks,
+   `apply`, and the global `WORKSPACE_TEXT_PATCH_BOUNDS_REVISION`, which feeds
+   S033's frozen patch-identity tuple. That tuple does not change.
+   - **Which revision a new session gets.** Every newly opened session is context
+     revision 2. Revision 1 exists only as sessions saved by earlier code; nothing
+     rewrites or upgrades them, and the provider factory is not called for them.
+   - **Absent means 1.** A revision-1 definition has no new field and encodes to
+     the same bytes, so its session identity and `initial_context_hash` are
+     unchanged, and its saved requests, actions, review and offer are unchanged. Its
+     system prompt constant is not edited.
+   - **Serialization.** Every new field has `skip_serializing_if`, and a field that
+     is not an `Option` also has `#[serde(default)]` for reading. This is not
+     optional: the loader recomputes `session_id` from the re-serialized definition
+     (`src/edit_session.rs:531-537`), so a field that re-serialized as a default
+     (`"x":0`) would make every saved revision-1 session fail with "unsupported or
+     changed edit session definition". Revision 2 always serializes
+     `reference_omitted` (Decision 1); the skip rule is what keeps revision 1 exact.
+   - **Consistency in `validate`.** `context_revision` is accepted only when absent
+     or 2; an explicit 1 is a second encoding of revision 1 and is rejected. A
+     revision-1 definition must carry no revision-2 field and no non-permitted
+     preview. A revision-2 definition re-checks its caps on load, not only when it
+     is opened: at most 8 reference entries, 1,024 bytes per preview, 4,096 preview
+     bytes in total, and a 1,024-byte summary.
+   - **Downgrade fails closed.** An older binary reading a revision-2 journal
+     rejects the definition at load (`deny_unknown_fields`, `src/edit_session.rs:531`)
+     before any code that closes a session, and its review still works because
+     `load_session_review` does not read the definition (`src/edit_review.rs`, about
+     `:466`). A test pins it.
+   - **Reuse.** The revision is fixed per session and the session identity already
+     differs between revisions. Reuse of a saved request is decided by exact intent
+     equality (`src/edit_session.rs:814`) and exact serialized-request equality
+     (`src/llama.rs:833-835`), not by the provider-profile rule, so a saved
+     request cannot be reused across revisions.
+   - **No migration.** The definition is stored as a JSON value. K5b confirms that
+     no schema change is needed.
+5. **No S033 limit rises; the existing fit rules decide what fits.** Every limit in
+   S033's table is unchanged: the 24,000-byte context and POST, the 65,536-byte
+   intent, 5 turns, 4 reads and 6,144 read bytes. New content lives inside the
+   existing budget.
+   - **Fit at open, with the real preparation function.** Open builds candidate
+     definitions in a fixed drop order: everything; then without the summary (it is
+     unverified and the files override it); then one fewer reference entry at a
+     time down to none. For each candidate it computes the session identity, builds
+     the provider for that identity through a factory the caller supplies, and calls
+     `compose_edit_intent` for turn 0. The first candidate that composes is frozen, with the omissions recorded. The
+     objective and constraints are never shortened. If no candidate composes,
+     opening is refused.
+   - **Only size failures move on.** A composed turn over the context, POST or
+     intent bound moves to the next candidate. Every other error (a profile or
+     identity mismatch, an invalid definition) is returned at once, so a wrong
+     profile does not try ten candidates and report a fit failure. A refused open
+     writes no session row, reserves no request and leaves the permission usable.
+     Both are tested.
+   - **Why a factory.** The v2 provider is built for one session identity and
+     rejects any other context (`for_admitted_editing_v2` at
+     `src/llama.rs:529-532`, checked at `src/llama.rs:569-572` and pinned by
+     `tests/llama_edit_v2.rs`). The identity depends on which candidate is chosen, so
+     open cannot take one prebuilt provider. It takes a factory called once per
+     candidate, at most ten times (the full candidate, one without the summary, and
+     eight entry counts down to none). The production callers build the provider
+     after open from the opened session (`model_for` at `src/workspace.rs:2387`, and
+     in `src/main.rs`); K5b changes that closure from `FnOnce` to `Fn` and adds the
+     candidate loop. Some tests (`tests/edit_session.rs`, `tests/edit_patch.rs`,
+     `tests/llama_edit_v2.rs`) call open directly with no provider and need a
+     trivial factory, and `tests/llama_edit_v2.rs` moves `profile` into its closure,
+     so it must clone to become `Fn`. The identity check in the wire is not
+     loosened.
+   - **No pure-size fallback.** A size-only estimate is rejected: a preparation
+     error after the session is loaded and its provider identity checked closes the
+     session (`src/edit_session.rs:821-823`; the load and identity errors at
+     `:798-802` return earlier), and there is one session per permission, so a
+     misjudged turn 0 would burn the task's permission and need a fresh admission
+     and grant. A flat reserve also cannot work when escaping multiplies by content
+     (see above).
+   - **Latent revision-1 gap, fixed for revision 2 only.** Today open checks only
+     the single-encoded definition (`src/edit_session.rs:742-745`), not the
+     double-encoded durable context or the wire. So a revision-1 turn 0 that does
+     not fit opens and is then closed at its first preparation. That contradicts
+     S033's "Refuse to open a session if required context cannot fit". Revision 2
+     refuses at open; revision 1 keeps its behavior and the gap is documented, not
+     changed.
+   - Reads still commit only when the next turn fits (S033 Chunk 4a). With a larger
+     constant context a later read may be shortened where it would not have been.
+     That is the intended trade and a live measurement, not a new limit.
+   - A large declared-file list already consumes the durable context through file
+     metadata. This decision does not change that.
+6. **Review surfaces show what the model saw.** For revision 2, `task-edit-review`
+   and the terminal task view report the context revision, the reference files
+   (count, paths, sizes, preview bytes), `reference_omitted` and the summary state
+   (included, cut, or dropped). Rendering stays escaped and size-capped as in
+   Chunk 5.
+   - The offer review's edit section is built from the action alone and has no
+     session (`src/workspace.rs:722-729`), and the session review loader does not
+     read the stored definition (`src/edit_review.rs`, `load_session_review`). K5c
+     adds a read-only read of the definition on each surface's own connection: the
+     offer review already holds a `Journal` (S033 Chunk 5 clarification 1), so it
+     reads through that, and `task-edit-review` and the terminal task view read
+     through `TaskReader`. The offer review can then carry one summary line for a
+     revision-2 session.
+   - New fields are skipped for revision 1, so revision-1 output is byte-identical.
+     A definition that cannot be parsed is reported as unreadable and does not
+     fail the review, and old journals with no session data keep working (S033
+     Chunk 5).
+
+### Amendments to S033
+
+For context revision 2 only, this decision amends two S033 sentences. Revision 1
+keeps them exactly.
+
+- The durable-context rule "include file previews only for permitted paths" now
+  also allows the bounded reference previews of Decision 1.
+- Chunk 3 clarification 3 says the provider sees only the objective, constraints,
+  allowed paths and, for each allowed file, its hash, size and bounded preview. For
+  revision 2 it also sees `reference_files` (no hash) and the labelled summary.
+
+### Bounds delta
+
+No S033 limit changes. Revision 2 adds two restrictive caps (entries and summary)
+and restates two inherited ones (previews), none of which loosens anything:
+
+| Surface | Cap | Enforcement |
+| --- | --- | --- |
+| Reference entries | At most 8, non-empty previews only, snapshot order | Frozen at open; re-checked when the definition loads. |
+| Reference preview bytes | 1,024 per file and 4,096 in total, both inherited from planning | No new bytes are captured; re-checked when the definition loads. |
+| Plan summary | At most 1,024 bytes, cut on a UTF-8 boundary | Frozen at open, with a truncation flag. |
+
+### Security and authority
+
+Reference previews and the summary are untrusted data. Repository text may contain
+instruction-like content, exactly as it already can in the planning context, and
+the summary is model output. Both are labelled data in the system prompt. Neither
+adds a tool, a path the model may read or write, or an authority. Output is still
+one typed tool call, and a patch is still checked against the permission, the
+admitted hashes and the S033 planner. A model cannot grant, widen or claim
+anything through these fields. The previews were already given to the planning
+model under the same admission, and their freshness is covered by the full-snapshot
+checks at every session boundary.
+
+### Alternatives considered
+
+| Option | Verdict |
+| --- | --- |
+| **`bounds_revision: 2`** | Rejected for this change. The bounds are unchanged, and the revision is pinned in the loader, observations, the wire, `apply` and the global constant behind S033's patch-identity tuple. Bumping it would change that tuple and need each site listed and changed. A separate context revision touches only the definition and the wire. |
+| **Read/find on non-permitted declared files** | Deferred. It would let the model reach `vitest.config.ts` or a test file on demand, but it widens read authority beyond the write permission, needs new path rules, review projections and tests, and relies on a worker that did not search when it could. Revisit if a run with this decision still fails for missing reference facts. |
+| **Raise `MAX_EDIT_READ_BYTES` or excerpt caps** | Rejected. A silent limit increase, and 11,643 bytes exceeds 6,144 anyway. |
+| **Grant write permission on `package.json` or tests to make them readable** | Rejected. It changes authority to fix visibility. |
+| **Filter invented npm commands in patch validation** | Rejected. Domain logic in a generic harness and a new kind of gate. |
+| **Rank previews by input kind in planning capture** | Out of scope. It changes planning context bytes, which S027 and the saved planning identities cover. Snapshot order is a known limit: a manifest ranked late gets no preview when earlier files use the 4,096 bytes. |
+| **Size-only fit check at open** | Rejected (Decision 5). |
+| **Thinking on with 1,024 tokens, or a larger local worker** | Later, single-variable experiments, only if this decision fails with the target text provably in the transcript. |
+
+### Consequences and limits
+
+- **What can be visible depends on the plan.** The edit model can only see files
+  the plan declares. In 7g `vitest.config.ts` and the stdio end-to-end test were
+  not declared, so this decision alone cannot show them. Declaring them belongs to
+  the verification plan (K4) and changes its revision. It is an operator decision,
+  and it also puts those files under receipt freshness.
+- **A 1,024-byte preview may cut a file.** `package.json` is 1,395 bytes and its
+  preview stops at 1,024. The scripts are inside it in 7g, but a manifest whose
+  scripts sit later would not be.
+- **Snapshot order decides who gets a preview.** With many declared files the
+  4,096-byte pool goes to the first few.
+- **The result stays one sample.** A live run with this decision changes the
+  prompt, the context and the summary together, so it shows whether the 4B worker
+  can do the task with sufficient context, not which change helped.
+- **Model-written summary risk.** A wrong summary can mislead the edit turn. The
+  label mitigates it and does not remove it.
+- **Revision 1 keeps its latent open-time gap** (Decision 5).
+- **A reference path can still close the session.** The enum in the revision-2
+  tool schemas removes the invitation, but if a model still names a reference or
+  other non-permitted path in a read, find or patch, the journal rejects it and
+  the session closes (Decision 3). That is fail-closed and cannot widen authority,
+  and it is why the enum and its test are part of the design.
+
+### Obligations for implementation
+
+Each is a test or review item before the increment is advertised or run live:
+
+1. **Revision-1 golden.** A saved revision-1 session definition, serialized request,
+   review and offer are byte-identical, its identity and `initial_context_hash` do
+   not change, and it still opens and prepares. Its review output carries no new
+   field. An older-binary downgrade test shows a revision-2 journal is rejected at
+   definition load and its review still works.
+2. **Revision-2 projection.** Reference files carry non-empty non-permitted
+   previews and never permitted ones or a hash. The caps (8 entries, 4,096 preview
+   bytes, 1,024-byte summary with the flag) hold on both sides, a multi-byte
+   boundary is cut cleanly, and files beyond the cap are cleared in the frozen
+   definition. `validate` rejects a revision-1 definition carrying revision-2
+   fields or previews, an explicit `context_revision: 1`, and a revision-2
+   definition over any cap (entries, 1,024 bytes per preview, 4,096 in total,
+   summary).
+3. **Fit at open.** Candidates are tried in the fixed order (full, without the
+   summary, then fewer entries), each composed with the real turn-preparation
+   function through the factory. Every drop step makes the frozen definition and
+   the composed context, POST and intent smaller, with `reference_omitted` always
+   serialized. The objective and constraints are never shortened. Opening is
+   refused only when no candidate composes, and a refused open writes no row,
+   reserves no request and leaves the permission usable. A non-size error (a
+   wrong-profile factory) is returned at once and does not try the other
+   candidates. Test with backslash-heavy,
+   control-character-heavy and quote-heavy previews (the 7g `package.json`
+   preview has 105 quotes), against the context, POST and intent limits.
+4. **One function.** The read-commit fit check and turn preparation still use the
+   same composing function, and a read shortened by the larger context is recorded
+   and charged for its actual bytes. The revision-2 prompt and projection add
+   nothing on a patch-only or reads-closed turn, so the turn after a refused read
+   is never larger than the refused turn.
+5. **No authority change.** `read_task_text`, `find_task_text` and the patch still
+   reject a reference-only path, and a hostile mock that names one proves the
+   journal rejects it and closes the session with no write. The revision-2 tool
+   schemas carry the `allowed_paths` enum and the revision-1 schemas do not, and
+   whether llama.cpp enforces the enum is tested. `apply` and the patch-identity
+   tuple are byte-for-byte unchanged; the provider's session-identity check is not
+   loosened. Mutation checks pin these.
+6. **Review and offer.** Revision-2 sessions show the context revision, reference
+   files, omissions and summary state in `task-edit-review`, the terminal view and
+   the offer review. Escaping and size caps hold. Revision-1 and older journals are
+   unchanged, and an unreadable definition is reported without failing.
+7. **Both platforms.** Windows and Docker Linux: formatting, locked tests and
+   warnings-denied Clippy, and an independent review in a fresh session before the
+   operator accepts.
+
+### Delivery
+
+- **K5a.** This decision reviewed independently, then accepted or amended by the
+  operator. Docs only.
+- **K5b.** Definition context revision 2 with its serde compatibility, the
+  projection, the revision-specific system prompt and the wire field, the fit-at-
+  open candidate loop (with the `FnOnce` to `Fn` factory change for the callers),
+  the revision-2 tool-schema `path` enum with its llama.cpp test, and the revision-1
+  golden. The projection and the fit rule land together because the fit cannot be
+  measured without the projection.
+- **K5c.** Review and offer surfaces, including the definition reads on the offer's
+  `Journal` and on `TaskReader`.
+- **K5d.** Tests, both gates, independent review, operator acceptance.
+- **K4 (parallel, operator).** Retire the known-broken plan file
+  `.shuttle/emcp-agents-live-test-plan.json`. Decide whether the plan declares
+  `vitest.config.ts` and the end-to-end test.
+- **K6 (operator only).** A fresh state directory with r4's objective, constraints
+  and profile: thinking off, 512 tokens, the same worker. It succeeds when the
+  edit transcript contains the target spans and the `package.json` scripts, the
+  patch changes those spans and references only existing scripts, the emCP check
+  passes, and the operator accepts. Compare with 7g. A failure with the target text
+  provably in the transcript is the input to a larger-worker experiment, not to
+  this decision.
+
+### Review record
+
+An independent Opus : high review (fresh session, read-only, 2026-09-26) found no
+path that raises a limit or widens read or write authority, and none that changes
+revision-1 behavior if implemented as written. It found four factual errors in the
+first draft, all corrected above: the open-time API (a single provider cannot be
+built before the session identity is known; the factory replaces it), the
+measurement units (the table is now UTF-8 bytes), an unreachable four-read
+extrapolation (the read budget is three full reads), and a misstatement of current
+open-time behavior. It also found that bumping `bounds_revision` would touch S033's
+patch-identity tuple, which the separate context revision avoids.
+
+A focused re-check of the revision (a second fresh Opus : high session, the same
+day) found the first review's six main findings resolved and the measurements
+table exact. It found one new High issue and nine smaller ones, all applied above:
+a reference path could close the session through a read or find (the
+`allowed_paths` enum, Decision 3); which revision a new session gets; where the new
+fields live and how a dropped summary is recorded; turn invariance for the refused-
+read argument; the review plumbing cross-reference; the serde rule; the count
+always being serialized; only size failures moving to the next candidate; the
+escaping arithmetic; and several overbroad statements. A further check of these
+edits is optional.
