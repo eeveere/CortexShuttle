@@ -1222,9 +1222,12 @@ list.
   (`not_started`). (6) re-admission does not repeat the preflight gate:
   documented, not changed. Not applied: checking cancellation before the
   launch checks, and re-running the launch checks at re-admission.
-- **K3d.** No change was needed. The Windows environment baseline (`SystemRoot`,
-  `ComSpec`, `PATH`, `TEMP`/`TMP` outside the workspace, `node.exe` with
-  `npm-cli.js`) was already in the manual qualification guide.
+- **K3d.** The Windows environment baseline (`SystemRoot`, `ComSpec`, `PATH`,
+  `TEMP`/`TMP` outside the workspace, `node.exe` with `npm-cli.js`) was already in
+  the manual qualification guide. That guide is a local file under the ignored
+  `docs/manual-qualifications` directory and has never been committed, so this
+  was not a repository record. The baseline is now also recorded in the tracked
+  [plan v2 record](manual-qualifications/emcp-plan-v2.md).
 - Gates on the final tree, after the review fixes: Windows 272 passed, 0 failed,
   10 ignored; Docker Linux (pinned Rust 1.98 / Python 3.14.7 image) 273 passed,
   0 failed, 10 ignored; formatting and warnings-denied Clippy pass on both.
@@ -1238,9 +1241,16 @@ list.
   labelled plan summary and a revision-2 context) was drafted, independently
   reviewed twice and accepted by the operator on 2026-09-26. Implementation
   (K5b-K5d) has not started; see S034 in `docs/decisions.md`.
-- Still open from Chunk 7: K4 (the known-broken plan file), S034's K5
-  implementation, K6's live run and step 9's manual terminal records. The optional
-  workspace-pollution evidence stays deferred.
+- K4 (2026-09-26): emCP verification plan v2 written and validated by a scratch
+  intake and preflight, with no emCP file touched. It replaces the known-broken
+  plan file and plan `e`, which named `C:\dev\agentic\emCP` (no longer present),
+  drops the `--prefix` workaround, declares four inputs sized to the preview pool
+  and the edit-context budget, and adds a read-only `doc-scripts-exist` check. See
+  [the record](manual-qualifications/emcp-plan-v2.md). The model-free baseline run
+  against emCP is the operator's step and has not been run.
+- Still open from Chunk 7: K4's baseline run, S034's K5 implementation, K6's live
+  run and step 9's manual terminal records. The optional workspace-pollution
+  evidence stays deferred.
 
 ## Milestone 3 scope check (2026-09-21)
 
