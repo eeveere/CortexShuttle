@@ -238,8 +238,11 @@ reopened; continuing needs a fresh task state with a new admission and grant. A
 run that holds any saved v1 whole-file edit request or action cannot start a v2
 session. Nothing generates v1 edit requests any more, and historical whole-file
 actions remain readable, offerable and reviewable as file summaries. The v2
-protocol is implemented against mock workers only. No live worker qualification
-has been run yet.
+protocol was qualified once against the live worker on the real emCP task
+(2026-09-25, [record](manual-qualifications/emcp-2026-09-25-chunk7.md)): the
+patch turn completed compactly and applied exactly, and the operator rejected
+the patch on its merits. That qualifies the protocol, not task success; see
+S033's closure clarification.
 
 After a successful patch, declared inputs no longer match the old admission. Run
 the explicit `task-readmit`, then `task-verify-all` and `task-verify-evidence` to

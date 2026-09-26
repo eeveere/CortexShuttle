@@ -1126,8 +1126,39 @@ focused re-check (Opus : high, a separate session, 2026-09-25) passed. It
 found two Low items, both fixed: `task-edit-review`'s v1 sentence
 now says only `run-status` lists the requests (RC-1), and the v1 request
 fixture now pauses the run as the removed executor did (RC-2). The operator
-accepted Chunk 6 on 2026-09-25. Chunk 7, the live qualification, is still
-pending.
+accepted Chunk 6 on 2026-09-25.
+
+Chunk 7 (2026-09-25) repeated r4's objective, constraints and profile against
+the live Qwen3.5-4B worker
+([record](manual-qualifications/emcp-2026-09-25-chunk7.md)). Attempt 7g
+completed the whole v2 workflow:
+- planning, the grant for `AGENTS.md` only, and three bounded reads;
+- a compact patch of 1,367 bytes and 221 of 512 output tokens, applied
+  exactly;
+- re-admission, and the full emCP check passing (19 files, 125 tests);
+- the offer, and an explicit operator reject.
+
+The patch invents `npm run test:mcp` and misses the guidance the objective
+targets. A separate Opus : high evidence review found no protocol defect and
+no raised limit or weakened gate. It put the wrong patch down to the edit
+context and the model's read strategy.
+
+On the way, the verification plan needed fixes: `node.exe` instead of
+`npm.cmd`, and an environment with `ComSpec`, `PATH`, `TEMP` and `TMP`. The
+fixed plan is "plan `e`". The original plan file is known-broken. The work
+also exposed two executor follow-ups: the verbatim `\\?\` working directory,
+and the `unknown` status label.
+
+The operator amended Chunk 7 criterion 6 and S033 intended outcome 8 so that
+they require an explicit decision on the merits rather than acceptance. On
+that basis, S033 is closed (2026-09-25; see S033's closure clarification).
+This qualifies the protocol, not task success. Still open:
+- Chunk 7 step 9, the Windows Terminal and native Linux manual-usability
+  records;
+- the executor and plan-file follow-ups;
+- an edit-context-sufficiency increment and a comparable live run.
+
+Closing S033 does not close Milestone 3 (see the scope check below).
 
 ## Milestone 3 scope check (2026-09-21)
 

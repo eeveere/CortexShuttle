@@ -585,10 +585,13 @@ acceptance or finalization from display state.
 
 2026-09-16. Accepted design. Implemented against mock workers in Chunks 1-5
 (2026-09-16 to 2026-09-25) and reviewed chunk by chunk, except Chunk 2a, a
-mechanical build gate with no reviewer by design. **Not yet qualified against
-a live worker** (Chunk 7). Chunk 6's independent audit found required fixes.
-They were applied, a separate focused re-check passed after two small fixes,
-and the operator accepted Chunk 6 (all 2026-09-25).
+mechanical build gate with no reviewer by design. Chunk 6's independent audit
+found required fixes. They were applied, a separate focused re-check passed
+after two small fixes, and the operator accepted Chunk 6 (all 2026-09-25).
+**Qualified live and closed 2026-09-25 (Chunk 7), under an explicit operator
+amendment of the exit criterion:** the protocol passed once on the real emCP
+task, and the operator rejected the patch it produced. See the closure
+clarification below.
 The sections below are the frozen contract, and the dated clarifications record
 what implementation settled. This supersedes S029's whole-file wire
 representation for future admitted edits only. S015's exact-byte principle and S028–S032's human
@@ -1106,6 +1109,59 @@ action. So `task-edit-review` reports the recorded v1 requests instead of
 saying no edit was attempted, and its `--json` `null` means only "no v2
 session and no edit action". The count is a read-only query on saved
 requests, through `TaskReader`.
+
+Closure (2026-09-25, Chunk 7; operator decision). The live qualification
+([record](manual-qualifications/emcp-2026-09-25-chunk7.md)) repeated r4's
+objective, constraints and profile (digest `c02198cf…`, thinking off,
+`max_tokens` 512) in fresh task states. Attempt 7g met Chunk 7 pass criteria
+1–5:
+- the patch response was 1,367 bytes, with 221 of 512 output tokens;
+- one exact hunk was applied, and the observed post hash equals the
+  prediction;
+- permission, action, receipt, offer and decision are all inspectable;
+- Shuttle started or reconfigured no endpoint and created no commit or
+  worktree.
+
+The full emCP check passed. Criterion 6 was not met: the operator rejected the
+patch, which invents `npm run test:mcp` and never reaches the guidance the
+objective targets. The final evidence review found no protocol defect, no
+raised limit and no weakened gate. It put the wrong patch down to two causes:
+- **Edit context.** Edit turns see only permitted files (the model-facing
+  projection in the Chunk 3 clarification above), so `package.json` and the
+  plan summary were absent. The target lines lay beyond the bytes the model
+  chose to read.
+- **The model's read strategy.** It read linearly and never called
+  `find_task_text`.
+
+The operator amended the exit criterion rather than reinterpreting it. The
+original texts stay in the plan, marked as amended:
+- **Chunk 7 criterion 6.** "The full emCP check passes and the human reviewer
+  accepts the change on its merits" becomes: the full emCP check passes and the
+  human reviewer makes an explicit accept or reject decision on the merits
+  through the task offer. 7g meets it: the check passed, offer `721b17b8…` was
+  reviewed, and the reject is recorded.
+- **Intended outcome 8.** "The original emCP documentation task completes in a
+  fresh task state with a compact response comfortably inside the configured
+  token and transport bounds" becomes: the original task runs in a fresh task
+  state to an explicit human decision, with a compact edit response comfortably
+  inside those bounds. Whether the task can complete, with acceptance, is not
+  claimed.
+
+Closure does not establish:
+- **Task success.** It does not show that the task can be completed, or that
+  the 4B worker can complete it given enough context. That needs a separately
+  scoped increment for edit-context sufficiency, followed by a comparable live
+  run.
+- **Live coverage of every outcome.** Outcomes 2, 5 and 6 (v1 replay refusal,
+  failures before any write, unknown after interruption) and finalization were
+  not exercised live. They rest on the Chunk 1–6 tests and audits.
+- **Planning headroom.** The streamed v1 planning turn used 34,279 of 65,536
+  transport bytes for 148 tokens in 7g, so a planning reply above about 280
+  tokens would reach r4's failure mode. Planning v1 is outside this decision.
+- **Chunk 7 step 9.** The Windows Terminal and native Linux manual-usability
+  records were planned separately and remain open.
+
+This closure changes no contract, bound, stored byte or code.
 
 ### Protocol examples
 
