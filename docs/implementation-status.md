@@ -1280,9 +1280,12 @@ list.
   ("agents.MD") that differs from 7g's; it affects nothing in that run, and K6
   must use a new state directory and the exact 7g text, checked by hash before
   its intake.
-- K4 is complete. Still open from Chunk 7: S034's K5 implementation, K6's live run
-  and step 9's manual terminal records. The optional workspace-pollution evidence
-  stays deferred.
+- K4 is complete, and S034's implementation (K5) is done and accepted. Still open
+  from Chunk 7: K6's live run and step 9's manual terminal records. The K6 runbook
+  and a read-only transcript dump script (`k6-transcript-dump.py`, which checks
+  whether the target lines and the `package.json` scripts reached the model) are in
+  [the plan-v2 record](manual-qualifications/emcp-plan-v2.md). The optional
+  workspace-pollution evidence stays deferred.
 
 ## Milestone 3 scope check (2026-09-21)
 
