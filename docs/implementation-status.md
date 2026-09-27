@@ -924,7 +924,8 @@ the task without applying a workspace action. This is a protocol problem, not
 an emCP problem: the v1 admitted-edit protocol requires the model to return
 every byte of every replacement file as JSON integers, so a small change to an
 approximately 11.6 KiB file such as `AGENTS.md` exceeds the configured output
-budget and transport envelope. `.shuttle/DO-WE-REALLY-HAVE-TO-REPLACE-THE-WHOLE-FILE.md`
+budget and transport envelope.
+[`docs/plans/DO-WE-REALLY-HAVE-TO-REPLACE-THE-WHOLE-FILE.md`](plans/DO-WE-REALLY-HAVE-TO-REPLACE-THE-WHOLE-FILE.md)
 records the resulting v2 bounded transactional text-patch protocol and an
 eight-chunk delivery plan (Chunk 0 through Chunk 7) that replaces it while
 keeping the existing admission, permission, durability, freshness, review and
@@ -1309,3 +1310,11 @@ exit evidence. This entry exists because the gap was previously silent: the
 milestones" note above (2026-09-13, predating this entire increment) reads as
 still current but does not say whether that work is expected inside Milestone
 3 or after it. That ambiguity is unresolved as of this entry.
+
+A chunk plan for the remaining three deliverables (Milestone 3b: repository
+membership, sibling retrieval, hydration inventories) was later drafted at
+[`docs/plans/WHO-COUNTS-AS-THE-SAME-REPOSITORY.md`](plans/WHO-COUNTS-AS-THE-SAME-REPOSITORY.md),
+Chunks 8-12, continuing the Chunk 0-7 numbering. It answers this entry's
+question by treating 3b as a separate delivery sequence after 3a, but that is
+the plan's own framing, not a resolution the operator has confirmed. Drafting
+the plan is not starting it: no Chunk 8-12 work has begun.
