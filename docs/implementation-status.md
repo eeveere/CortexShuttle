@@ -1261,7 +1261,7 @@ list.
   and a second independent review of the whole increment (K5d) found no read of the
   workspace, model call or authority in the review and no change to revision-1
   output; its findings are applied. The operator accepted the implementation on
-  2026-09-26. Not done: K6's live run, an end-to-end revision-1 session golden from
+  2026-09-26. Not done: an end-to-end revision-1 session golden from
   a pre-change harness, and proof of composed-size monotonicity and of the adapter
   POST and intent size classifications at open; acceptance does not change what
   S034's obligations table lists as unproven, which the clarifications at the end
@@ -1281,11 +1281,23 @@ list.
   ("agents.MD") that differs from 7g's; it affects nothing in that run, and K6
   must use a new state directory and the exact 7g text, checked by hash before
   its intake.
-- K4 is complete, and S034's implementation (K5) is done and accepted. Still open
-  from Chunk 7: K6's live run and step 9's manual terminal records. The K6 runbook
-  and a read-only transcript dump script (`k6-transcript-dump.py`, which checks
-  whether the target lines and the `package.json` scripts reached the model) are in
-  [the plan-v2 record](manual-qualifications/emcp-plan-v2.md). The optional
+- K6 (2026-09-28): the operator ran the live run in `.shuttle\k6-280926` with 7g's
+  worker, profile and exact objective and constraint, and rejected the offer. The
+  workflow completed with no retries. Plan, grant (`AGENTS.md` only), edit,
+  re-admission and both checks all succeeded, and the emCP diff was `AGENTS.md`
+  only. The patch did not meet the objective. The model read `AGENTS.md` from the
+  top until the 6,144-byte read budget ran out at line 169, and it never called
+  `find_task_text`. It then edited the one testing block it had seen, which was
+  already correct. The two target spans (lines 238-242 and 346-350) did not reach
+  the model and were not changed. The checks passed because nothing broke, and
+  neither can tell whether the objective was met. By the runbook's table this is
+  a context or strategy failure, not a capability failure. Reads from the top
+  under this budget cannot reach the spans, so the next step points at the read
+  budget or the `find_task_text` guidance, not a larger worker. Rejecting did not
+  revert the workspace. The operator restored `AGENTS.md` by hand. One sample. See
+  [the K6 outcome](manual-qualifications/emcp-plan-v2.md).
+- K4 and K6 are complete, and S034's implementation (K5) is done and accepted.
+  Still open from Chunk 7: step 9's manual terminal records. The optional
   workspace-pollution evidence stays deferred.
 
 ## Milestone 3 scope check (2026-09-21)

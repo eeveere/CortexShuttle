@@ -315,3 +315,74 @@ Save the dump output and the review outputs somewhere outside the state director
 admission and run ids, the plan revision, the profile digest, the worker build, the
 Shuttle commit, emCP's HEAD, and your decision. Then add a "K6 outcome" section to
 this record, as the baseline run did.
+
+## K6 outcome (operator run, 2026-09-28)
+
+The operator ran the K6 runbook in `.shuttle\k6-280926` and rejected the offer.
+Result: **the workflow completed; the patch did not meet the objective.** It is
+one sample.
+
+- **Setup.** The objective and constraint hashes matched 7g (`b2248409…`,
+  `78a598b0…`). Profile `.shuttle\chunk-7g\emcp-worker-profile.json`, digest
+  `c02198cf…`. Worker build `b10278-d52ec04a6` with
+  `C:\models\workers\Qwen3.5-4B-Q4_K_M.gguf`, unchanged from 7g, with the same
+  startup arguments. emCP HEAD `a6527896e6ea0fea047f7425c60e4db877c7aacb`, the same as the
+  baseline. Shuttle at `7edcb0f`.
+- **Identities.** Intake `a0e1b4bc-5182-4bdc-99a5-5632bf4cbbaf`, first admission
+  `05de0e17-1443-435b-bf00-57c96ec09bb7`, re-admission
+  `1f4f801c-9329-4130-968e-52479e10c7d6`, run
+  `e9f2cde9-0ce5-4aec-a947-8b1891c9433c`. Plan revision `20f0565b…` (unchanged),
+  preflight snapshot `1554dc79…`, post-edit snapshot `21b50708…`. Context
+  `9c42eebb…`, permission `fe3dbe4e-4382-4efc-857b-9807de67ff37`, edit session
+  `aca745fcb041`, offer `d56a2b84-b6db-4827-95e8-967846eb86cf`.
+- **Plan.** One model request. The proposal named only `AGENTS.md`, so the grant
+  was made. Its summary already framed the task wrongly: "the MCP stdio end-to-end
+  test is the default behavior".
+- **Edit.** Context revision 2, with all three reference files shown (none
+  omitted) and the plan summary included (158 B). Turns 0 to 2 read `AGENTS.md`
+  from the top in 2,048-byte reads (lines 1 to 169). That used 3 of 4 reads and
+  all 6,144 read bytes. Turn 3 recorded the patch. There was no `find_task_text`
+  call, no token-limit stop and no retry. It made five model responses in all.
+- **Patch.** One hunk in the Essential Commands block (bytes 351 to 495, 11,643 to
+  11,717 bytes). It added "opt-in" to the live-test comment, which was already
+  correct. It also added a second `npm run test`, labelled "Run MCP stdio
+  end-to-end tests (default behavior)", two lines under the existing one. Neither
+  target span changed. "End-to-End Tests (tests/e2e/)" still says the e2e tests
+  run against a live endpoint through `npm run test:live`. "Testing" still labels
+  `npm run test` "Unit tests only" and `npm run test:live` "Integration tests
+  only". The emCP diff was `AGENTS.md` only, and the read-back matched.
+- **Verification.** `full-check` and `doc-scripts-exist` both passed on the
+  re-admitted snapshot. Their pre- and post-snapshots were equal, with no stale
+  reason and no waivers. Suite evidence was recorded. Both checks passed because
+  the patch broke nothing: prettier accepts it and both named scripts exist.
+  Neither check can see whether the objective was met.
+- **Decision.** Rejected from the terminal UI (decision key
+  `terminal/task/d56a2b84-…/reject`) because the patch leaves both wrong spans in
+  place and adds a redundant command.
+- **Transcript criteria.** Both target spans were **not covered** (238-242 and
+  346-350). The `test:live`, `"test": "vitest run"` and
+  `RUN_LIVE_EMBEDDING_TEST === '1'` literals were all seen, in reference previews
+  and the turn-0 read. The dump is saved in `.shuttle\k6-notes\transcript-dump.txt`.
+
+**Reading.** This is the first row of the outcome table: a context or strategy
+failure, not a capability failure. The table misses one detail. A 6,144-byte read
+budget cannot reach line 238 of an 11,643-byte file through reads from the top,
+so a correct patch needed `find_task_text`. The objective gives no location, so
+the model patched the only testing block it had seen, which matched the plan's
+wrong framing. The next step points at the read budget or the prompt's
+`find_task_text` guidance, not the larger-worker experiment.
+
+**Findings to record.**
+
+- **Rejecting does not revert the workspace.** After the rejection, emCP still
+  showed ` M AGENTS.md`. Restoring the file is a manual step. The operator reverted
+  it, and `git status --porcelain` in emCP is empty again. The run's phase is
+  `ready`.
+- **Checks can pass without the objective being met.** `full-check` and
+  `doc-scripts-exist` show only that nothing broke. Judging the objective is left
+  to the operator's decision.
+- **Runbook placeholders.** `<date>`, `<context id>` and `<admission id>` caused
+  three failed commands: an OS path error and two PowerShell `<` parse errors.
+  None of them reached the journal. The transcript dump was not run during the
+  live sequence. It was run afterwards against the closed journal, which gives
+  the same result.

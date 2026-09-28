@@ -1219,7 +1219,9 @@ the obligations above before the capability is advertised or qualified live.
 ## S034 — Show admitted edit sessions read-only reference context
 
 2026-09-26. **Accepted design; K5b and K5c implemented, independently reviewed and
-accepted by the operator on 2026-09-26; K6's live run is still open.** The
+accepted by the operator on 2026-09-26; K6's live run was done on 2026-09-28 and
+its patch rejected (see the K6 outcome in
+[the plan-v2 record](manual-qualifications/emcp-plan-v2.md)).** The
 operator accepted it in chat on 2026-09-26, after two independent reviews and a
 revision the same day (see the review record). The design text below is frozen;
 the implementation clarifications at the end record what K5b settled and one
