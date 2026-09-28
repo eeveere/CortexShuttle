@@ -1296,6 +1296,13 @@ list.
   budget or the `find_task_text` guidance, not a larger worker. Rejecting did not
   revert the workspace. The operator restored `AGENTS.md` by hand. One sample. See
   [the K6 outcome](manual-qualifications/emcp-plan-v2.md).
+- K7 (open, 2026-09-28): find guidance for admitted edit sessions, planned in
+  [WHY-NOT-JUST-LOOK-IT-UP.md](plans/WHY-NOT-JUST-LOOK-IT-UP.md). Guidance
+  first, with no S033 limit raised: a read-only probe of prompt variants against
+  K6's recorded requests (operator-run), then an S035 decision for context
+  revision 3, its implementation, and a live rerun of K6's objective. A read
+  budget raise is held back as a separate S033 amendment, considered only if the
+  rerun shows find used and the budget still blocking.
 - K4 and K6 are complete, and S034's implementation (K5) is done and accepted.
   Still open from Chunk 7: step 9's manual terminal records. The optional
   workspace-pollution evidence stays deferred.
